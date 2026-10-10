@@ -10,3 +10,5 @@ export * from "./provider/types.js";
 export * from "./provider/sse.js";
 export * from "./provider/mock.js";
 export * from "./provider/huggingface.js";
+export * from "./presets/index.js";
+export * from "./provider/local.js";
