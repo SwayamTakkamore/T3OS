@@ -1,0 +1,12 @@
+{
+  "name": "@t3os/cli",
+  "version": "0.1.0",
+  "type": "module",
+  "bin": { "t3os": "./dist/bin.js" },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": { ".": "./dist/index.js" },
+  "files": ["dist"],
+  "scripts": { "build": "tsc -p tsconfig.json" },
+  "dependencies": { "@t3os/core": "workspace:*" }
+}
