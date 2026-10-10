@@ -13,3 +13,4 @@ export * from "./provider/huggingface.js";
 export * from "./presets/index.js";
 export * from "./provider/local.js";
 export * from "./tools/index.js";
+export * from "./permissions/index.js";
