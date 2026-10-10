@@ -235,4 +235,31 @@ describe("runTurn", () => {
     const replayed = await sessions.replay(session.id);
     expect(replayed.some((event) => event.type === "loop_detected")).toBe(true);
   });
+
+  it("calls onEvent for every emitted event in order", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "t3os-agent-"));
+    const sessions = new SessionStore(dir);
+    const session = await sessions.create("agent");
+
+    const seen: string[] = [];
+    const result = await runTurn({
+      provider: new MockProvider([
+        [
+          { type: "text", text: "hi" },
+          { type: "done" },
+        ],
+      ]),
+      store: sessions,
+      sessionId: session.id,
+      policy: createPolicy("auto-accept"),
+      root: dir,
+      prompt: "hello",
+      onEvent: (event) => seen.push(event.type),
+    });
+
+    expect(seen).toEqual(result.events.map((event) => event.type));
+    expect(seen).toContain("user_message");
+    expect(seen).toContain("text");
+    expect(seen[seen.length - 1]).toBe("turn_end");
+  });
 });

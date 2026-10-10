@@ -1,0 +1,95 @@
+import React, { useState } from "react";
+import { Box, Text, useInput } from "ink";
+import type { ApprovalOutcome, PermissionRequest } from "@t3os/core";
+import type { TranscriptState } from "./transcript.js";
+
+export interface PendingPermission {
+  request: PermissionRequest;
+  id: string;
+}
+
+export interface AppProps {
+  state: TranscriptState;
+  model: string;
+  onSubmit: (text: string) => void;
+  busy?: boolean;
+  permission?: PendingPermission | null;
+  onPermission: (outcome: ApprovalOutcome) => void;
+}
+
+export function App({
+  state,
+  model,
+  onSubmit,
+  busy = false,
+  permission = null,
+  onPermission,
+}: AppProps): React.ReactElement {
+  const [input, setInput] = useState("");
+
+  useInput((value, key) => {
+    if (permission) {
+      if (value === "y") onPermission("allow");
+      else if (value === "a") onPermission("always");
+      else if (value === "d") onPermission("session");
+      else if (value === "n") onPermission("deny");
+      return;
+    }
+    if (busy) return;
+    if (key.return) {
+      if (input.trim().length > 0) onSubmit(input);
+      setInput("");
+      return;
+    }
+    if (key.backspace || key.delete) {
+      setInput((current) => current.slice(0, -1));
+      return;
+    }
+    if (!key.ctrl && !key.meta && value) {
+      setInput((current) => current + value);
+    }
+  });
+
+  return (
+    <Box flexDirection="column">
+      <Text color="cyan">t3os · {model}</Text>
+      {state.entries.map((entry, index) => {
+        if (entry.kind === "user") {
+          return (
+            <Text key={index} color="green">
+              › {entry.text}
+            </Text>
+          );
+        }
+        if (entry.kind === "assistant") {
+          return <Text key={index}>{entry.text}</Text>;
+        }
+        if (entry.kind === "tool") {
+          const mark = entry.ok === undefined ? "…" : entry.ok ? "ok" : "fail";
+          return (
+            <Text key={index} color="yellow">
+              ⚙ {entry.name} [{mark}]
+            </Text>
+          );
+        }
+        return (
+          <Text key={index} color="red">
+            ! {entry.message}
+          </Text>
+        );
+      })}
+      {permission ? (
+        <Box flexDirection="column">
+          <Text color="magenta">
+            permission: {permission.request.tool} ({permission.request.toolClass})
+          </Text>
+          <Text>[y] allow [a] always [d] this session [n] deny</Text>
+        </Box>
+      ) : busy ? (
+        <Text dimColor>working…</Text>
+      ) : (
+        <Text color="gray">› {input}</Text>
+      )}
+    </Box>
+  );
+}

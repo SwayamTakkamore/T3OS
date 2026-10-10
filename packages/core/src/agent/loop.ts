@@ -19,6 +19,7 @@ export interface RunTurnOptions {
   prompt?: string;
   signal?: AbortSignal;
   onPermission?: (request: PermissionRequest, id: string) => Promise<ApprovalOutcome>;
+  onEvent?: (event: AgentEvent) => void;
   maxSteps?: number;
   maxRepeat?: number;
 }
@@ -88,6 +89,7 @@ export async function runTurn(opts: RunTurnOptions): Promise<TurnResult> {
 
   const emit = async (event: AgentEvent): Promise<void> => {
     events.push(event);
+    opts.onEvent?.(event);
     await store.append(sessionId, event);
   };
 
