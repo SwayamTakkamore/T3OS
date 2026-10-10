@@ -1,0 +1,7 @@
+{"type":"user_message","text":"echo hi"}
+{"type":"tool_call","name":"echo","class":"read"}
+{"type":"permission_decision","decision":"allow","mode":"auto-accept"}
+{"type":"tool_result","name":"echo","ok":true}
+{"type":"text","text":"Done."}
+{"type":"usage","inputTokens":12,"outputTokens":4}
+{"type":"turn_end","reason":"complete"}
