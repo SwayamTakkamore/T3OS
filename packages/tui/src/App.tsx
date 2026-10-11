@@ -30,7 +30,9 @@ export function App({
   const [input, setInput] = useState("");
 
   useInput((value, key) => {
-    if (key.ctrl && value === "t") {
+    // In node/ink, Ctrl+T can arrive either with key.ctrl === true && value === "t",
+    // or as raw control character ASCII 20 (\x14)
+    if ((key.ctrl && (value === "t" || value === "\x14")) || value === "\x14") {
       onOpenToken?.();
       return;
     }
@@ -51,7 +53,7 @@ export function App({
       setInput((current) => current.slice(0, -1));
       return;
     }
-    if (!key.ctrl && !key.meta && value) {
+    if (!key.ctrl && !key.meta && value && value.charCodeAt(0) >= 32) {
       setInput((current) => current + value);
     }
   });

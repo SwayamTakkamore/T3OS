@@ -50,7 +50,7 @@ export class HuggingFaceProvider implements Provider {
     tools: ToolSchema[],
     opts?: StreamOptions
   ): AsyncIterable<Delta> {
-    const base = this.#opts.baseUrl ?? "https://api-inference.huggingface.co/v1";
+    const base = this.#opts.baseUrl ?? "https://router.huggingface.co/v1";
     const body: Record<string, unknown> = {
       model: this.#opts.model,
       messages,
@@ -65,18 +65,32 @@ export class HuggingFaceProvider implements Provider {
     if (opts?.maxTokens !== undefined) body.max_tokens = opts.maxTokens;
     if (opts?.temperature !== undefined) body.temperature = opts.temperature;
 
-    const response = await this.#fetch(`${base}/chat/completions`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        authorization: `Bearer ${this.#opts.token}`
-      },
-      body: JSON.stringify(body),
-      signal: opts?.signal ?? null
-    });
+    let response: Response;
+    try {
+      response = await this.#fetch(`${base}/chat/completions`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${this.#opts.token}`
+        },
+        body: JSON.stringify(body),
+        signal: opts?.signal ?? null
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new T3osError("provider", `Network connection to HuggingFace failed: ${msg}`);
+    }
 
     if (!response.ok) {
-      throw new T3osError("provider", `HuggingFace request failed: ${response.status}`);
+      let detail = "";
+      try {
+        const errJson = (await response.json()) as { error?: { message?: string } | string };
+        if (typeof errJson.error === "string") detail = `: ${errJson.error}`;
+        else if (errJson.error?.message) detail = `: ${errJson.error.message}`;
+      } catch {
+        // ignore json parse error
+      }
+      throw new T3osError("provider", `HuggingFace request failed (${response.status})${detail}`);
     }
     if (!response.body) {
       throw new T3osError("provider", "HuggingFace response had no body");
@@ -93,19 +107,29 @@ export class HuggingFaceProvider implements Provider {
       const choice = chunk.choices?.[0];
       const delta = choice?.delta;
       if (delta?.content) yield { type: "text", text: delta.content };
-      for (const call of delta?.tool_calls ?? []) {
-        if (call.id && call.function?.name) {
-          openCallIds.set(call.index, call.id);
-          yield { type: "tool_call_start", id: call.id, name: call.function.name };
-        }
-        const args = call.function?.arguments;
-        const resolvedId = call.id ?? openCallIds.get(call.index);
-        if (args && resolvedId) {
-          yield { type: "tool_call_delta", id: resolvedId, argsJsonDelta: args };
+      if (delta?.tool_calls) {
+        for (const tc of delta.tool_calls) {
+          const existingId = openCallIds.get(tc.index);
+          if (!existingId && tc.id && tc.function?.name) {
+            openCallIds.set(tc.index, tc.id);
+            yield { type: "tool_call_start", id: tc.id, name: tc.function.name };
+          }
+          if (tc.function?.arguments) {
+            const id = openCallIds.get(tc.index);
+            if (id) {
+              yield {
+                type: "tool_call_delta",
+                id,
+                argsJsonDelta: tc.function.arguments
+              };
+            }
+          }
         }
       }
       if (choice?.finish_reason === "tool_calls") {
-        for (const openId of openCallIds.values()) yield { type: "tool_call_end", id: openId };
+        for (const id of openCallIds.values()) {
+          yield { type: "tool_call_end", id };
+        }
         openCallIds.clear();
       }
       if (chunk.usage) {
