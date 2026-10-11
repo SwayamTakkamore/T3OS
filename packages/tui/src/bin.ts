@@ -12,6 +12,8 @@ import {
   createPolicy,
   openBrowser,
   resolvePreset,
+  type EffortLevel,
+  type PermissionMode,
   type Provider,
 } from "@t3os/core";
 import { startRepl } from "./repl.js";
@@ -46,23 +48,28 @@ const config = await new ConfigLoader({
 
 const preset = resolvePreset(config.model, config.effort);
 
-async function makeProvider(): Promise<Provider> {
-  if (config.provider === "local") {
-    return new LocalProvider({ modelId: preset.id });
+async function makeProvider(
+  modelId: string = config.model,
+  effort: EffortLevel = config.effort,
+  providerType: "hf" | "local" = config.provider
+): Promise<Provider> {
+  const resolved = resolvePreset(modelId, effort);
+  if (providerType === "local") {
+    return new LocalProvider({ modelId: resolved.id });
   }
   const token = await new SecretResolver({ env: process.env }).resolve(
-    new SecretRef("HF_TOKEN"),
+    new SecretRef("HF_TOKEN")
   );
   if (!token) {
     throw new T3osError(
       "config",
-      "HF_TOKEN is not set; run `t3os auth login` or `t3os auth set <token>`",
+      "HF_TOKEN is not set; run `t3os auth login` or `t3os auth set <token>`"
     );
   }
   return new HuggingFaceProvider({
-    model: preset.id,
+    model: resolved.id,
     token,
-    contextLength: preset.contextLength,
+    contextLength: resolved.contextLength,
   });
 }
 
@@ -74,7 +81,7 @@ try {
     const opened = openBrowser(HF_TOKEN_URL);
     console.error("HF_TOKEN is not set.");
     console.error(
-      `Create one at ${HF_TOKEN_URL}${opened ? " (opening your browser…)" : ""}`,
+      `Create one at ${HF_TOKEN_URL}${opened ? " (opening your browser…)" : ""}`
     );
     console.error("Then run `t3os auth login` to store it.");
     process.exit(1);
@@ -90,8 +97,17 @@ await startRepl({
   sessionId: session.id,
   policy: createPolicy(config.permissionMode),
   root: config.projectRoot,
-  model: `${preset.id} (${config.effort})`,
+  model: preset.id,
+  effort: config.effort,
+  providerType: config.provider,
+  permissionMode: config.permissionMode,
   onOpenToken: () => {
     openBrowser(HF_TOKEN_URL);
+  },
+  onUpdateProvider: async (newModel, newEffort, newProviderType) => {
+    return makeProvider(newModel, newEffort, newProviderType);
+  },
+  onUpdatePolicy: (newMode: PermissionMode) => {
+    return createPolicy(newMode);
   },
 });

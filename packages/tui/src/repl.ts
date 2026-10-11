@@ -2,8 +2,11 @@ import React from "react";
 import { render } from "ink";
 import {
   builtInTools,
+  createPolicy,
   runTurn,
   type ApprovalOutcome,
+  type EffortLevel,
+  type PermissionMode,
   type PermissionPolicy,
   type PermissionRequest,
   type Provider,
@@ -24,8 +27,17 @@ export interface ReplOptions {
   policy: PermissionPolicy;
   root: string;
   model: string;
+  effort?: EffortLevel;
+  providerType?: "hf" | "local";
+  permissionMode?: PermissionMode;
   onTurnEnd?: (reason: TurnEndReason) => void;
   onOpenToken?: () => void;
+  onUpdateProvider?: (
+    newModel: string,
+    newEffort: EffortLevel,
+    newProviderType: "hf" | "local"
+  ) => Promise<Provider>;
+  onUpdatePolicy?: (newMode: PermissionMode) => PermissionPolicy;
 }
 
 export async function startRepl(options: ReplOptions): Promise<void> {
@@ -34,10 +46,20 @@ export async function startRepl(options: ReplOptions): Promise<void> {
   let pending: PendingPermission | null = null;
   let resolvePermission: ((outcome: ApprovalOutcome) => void) | null = null;
 
+  let currentProvider = options.provider;
+  let currentPolicy = options.policy;
+  let currentModel = options.model;
+  let currentEffort = options.effort ?? "high";
+  let currentPermissionMode = options.permissionMode ?? "ask";
+  let currentProviderType = options.providerType ?? "hf";
+
   const view = (): React.ReactElement =>
     React.createElement(App, {
       state,
-      model: options.model,
+      model: currentModel,
+      effort: currentEffort,
+      permissionMode: currentPermissionMode,
+      providerType: currentProviderType,
       busy,
       permission: pending,
       onSubmit: (text: string) => {
@@ -54,6 +76,60 @@ export async function startRepl(options: ReplOptions): Promise<void> {
         state = emptyTranscript();
         draw();
       },
+      onChangeModel: async (newModel: string) => {
+        currentModel = newModel;
+        if (options.onUpdateProvider) {
+          try {
+            currentProvider = await options.onUpdateProvider(
+              currentModel,
+              currentEffort,
+              currentProviderType
+            );
+          } catch {
+            // Keep existing provider if re-creation fails
+          }
+        }
+        draw();
+      },
+      onChangeEffort: async (newEffort: EffortLevel) => {
+        currentEffort = newEffort;
+        if (options.onUpdateProvider) {
+          try {
+            currentProvider = await options.onUpdateProvider(
+              currentModel,
+              currentEffort,
+              currentProviderType
+            );
+          } catch {
+            // Keep existing provider if re-creation fails
+          }
+        }
+        draw();
+      },
+      onChangeProvider: async (newType: "hf" | "local") => {
+        currentProviderType = newType;
+        if (options.onUpdateProvider) {
+          try {
+            currentProvider = await options.onUpdateProvider(
+              currentModel,
+              currentEffort,
+              currentProviderType
+            );
+          } catch {
+            // Keep existing provider if re-creation fails
+          }
+        }
+        draw();
+      },
+      onChangePermissionMode: (newMode: PermissionMode) => {
+        currentPermissionMode = newMode;
+        if (options.onUpdatePolicy) {
+          currentPolicy = options.onUpdatePolicy(newMode);
+        } else {
+          currentPolicy = createPolicy(newMode);
+        }
+        draw();
+      },
       ...(options.onOpenToken ? { onOpenToken: options.onOpenToken } : {}),
     });
 
@@ -68,10 +144,10 @@ export async function startRepl(options: ReplOptions): Promise<void> {
     state = reduceTranscript(state, { type: "user_message", text });
     draw();
     const result = await runTurn({
-      provider: options.provider,
+      provider: currentProvider,
       store: options.store,
       sessionId: options.sessionId,
-      policy: options.policy,
+      policy: currentPolicy,
       root: options.root,
       tools: builtInTools(),
       onEvent: (event) => {
