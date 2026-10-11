@@ -41,7 +41,16 @@ interface TransformersModule {
 
 async function transformersGenerate(modelId: string): Promise<GenerateFn> {
   const specifier = "@huggingface/transformers";
-  const mod = (await import(specifier)) as unknown as TransformersModule;
+  let mod: TransformersModule;
+  try {
+    mod = (await import(specifier)) as unknown as TransformersModule;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `Failed to load @huggingface/transformers for local inference: ${msg}. ` +
+      `Ensure @huggingface/transformers is installed or configure an active local runtime.`
+    );
+  }
   const generator = await mod.pipeline("text-generation", modelId);
   return async function* generate(prompt, opts) {
     const queue: string[] = [];

@@ -184,7 +184,7 @@ export function App({
     if (currentMenu === "provider") {
       const providerOptions: Array<{ type: "hf" | "local"; label: string; desc: string }> = [
         { type: "hf", label: "Hugging Face", desc: "Inference API using HF_TOKEN" },
-        { type: "local", label: "Local Provider", desc: "llama.cpp / ollama localhost" },
+        { type: "local", label: "Hugging Face (Local)", desc: "@huggingface/transformers ONNX engine" },
       ];
       const items: MenuItem[] = providerOptions.map((opt) => ({
         label: opt.label,

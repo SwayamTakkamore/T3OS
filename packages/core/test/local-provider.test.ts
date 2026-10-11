@@ -28,4 +28,13 @@ describe("LocalProvider", () => {
     const provider = new LocalProvider({ modelId: "google/gemma-2-2b-it", generate: fakeGenerate });
     expect(provider.capabilities().toolCalling).toBe(false);
   });
+
+  it("fails gracefully with helpful message when @huggingface/transformers is missing", async () => {
+    const provider = new LocalProvider({ modelId: "google/gemma-2-2b-it" });
+    await expect(async () => {
+      for await (const _ of provider.streamChat([{ role: "user", content: "hi" }], [])) {
+        // stream
+      }
+    }).rejects.toThrow(/Failed to load @huggingface\/transformers/);
+  });
 });
