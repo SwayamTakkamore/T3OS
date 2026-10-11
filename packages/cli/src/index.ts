@@ -15,9 +15,11 @@ import {
   builtInTools,
   createPolicy,
   openBrowser,
+  resolvePreset,
   runTurn,
   systemKeyring,
   type ConfigFile,
+  type EffortLevel,
   type Keyring,
   type PermissionMode,
   type Provider,
@@ -43,7 +45,7 @@ const USAGE = [
   "Commands:",
   "  help                     Show this help",
   "  version                  Print the T3OS version",
-  "  models                   List the bundled Gemma presets",
+  "  models                   List bundled Gemma presets and variants",
   "  auth status              Report whether HF_TOKEN is configured",
   "  auth set <token>         Store HF_TOKEN in the system keyring",
   "  auth login               Open the HF token page and store HF_TOKEN",
@@ -53,7 +55,8 @@ const USAGE = [
   "  run <prompt...>          Run a one-shot agent turn",
   "",
   "Options:",
-  "  --model <id>             Override the model",
+  "  --model <id>             Model ID or alias (e.g. gemma-4, gemma-3-12b, gemma-2-9b)",
+  "  --effort <level>         Reasoning/effort: low | medium | high | max (default: high)",
   "  --permission <mode>      ask | auto-accept | read-only",
   "  --provider <name>        hf | local",
 ].join("\n");
@@ -61,6 +64,7 @@ const USAGE = [
 const CONFIG_KEYS = [
   "model",
   "provider",
+  "effort",
   "permissionMode",
   "maxTurns",
   "loopThreshold",
@@ -78,7 +82,17 @@ async function resolveConfig(
   flags: Record<string, string | boolean>
 ): Promise<ResolvedConfig> {
   const overrides: Partial<ConfigFile> = {};
-  if (typeof flags.model === "string") overrides.model = flags.model;
+  if (typeof flags.model === "string") {
+    overrides.model = flags.model;
+  }
+  if (
+    flags.effort === "low" ||
+    flags.effort === "medium" ||
+    flags.effort === "high" ||
+    flags.effort === "max"
+  ) {
+    overrides.effort = flags.effort as EffortLevel;
+  }
   if (typeof flags.permission === "string") {
     overrides.permissionMode = flags.permission as PermissionMode;
   }
@@ -106,8 +120,9 @@ async function defaultProvider(
   config: ResolvedConfig,
   deps: CliDeps
 ): Promise<Provider> {
+  const preset = resolvePreset(config.model, config.effort);
   if (config.provider === "local") {
-    return new LocalProvider({ modelId: config.model });
+    return new LocalProvider({ modelId: preset.id });
   }
   const token = await resolveToken(deps);
   if (!token) {
@@ -116,13 +131,27 @@ async function defaultProvider(
       "HF_TOKEN is not set; run `t3os auth login` or `t3os auth set <token>`"
     );
   }
-  return new HuggingFaceProvider({ model: config.model, token });
+  return new HuggingFaceProvider({
+    model: preset.id,
+    token,
+    contextLength: preset.contextLength,
+  });
 }
 
 function cmdModels(deps: CliDeps): number {
+  deps.out("Available Gemma Models & Variants (Gemma 4, 3, 2):");
+  deps.out("---------------------------------------------------------------------------------");
+  deps.out("Model ID / Alias\t\t\tContext\t\tMax Tokens\tGeneration");
+  deps.out("---------------------------------------------------------------------------------");
   for (const preset of GEMMA_PRESETS) {
-    deps.out(`${preset.id}\t${preset.contextLength} ctx\t${preset.maxTokens} max`);
+    let gen = "Gemma 2";
+    if (preset.id.includes("gemma-4")) gen = "Gemma 4";
+    else if (preset.id.includes("gemma-3")) gen = "Gemma 3";
+    deps.out(`${preset.id.padEnd(32)}\t${preset.contextLength} ctx\t${preset.maxTokens} max\t[${gen}]`);
   }
+  deps.out("---------------------------------------------------------------------------------");
+  deps.out("Effort Levels: low (concise), medium (balanced), high (thorough), max (extended)");
+  deps.out("Example: t3os run --model gemma-4 --effort max \"Write a fast parser\"");
   return 0;
 }
 

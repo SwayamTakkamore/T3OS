@@ -11,19 +11,44 @@ import {
   T3osError,
   createPolicy,
   openBrowser,
+  resolvePreset,
   type Provider,
 } from "@t3os/core";
 import { startRepl } from "./repl.js";
+
+// Parse CLI flags (e.g. node bin.js --model gemma-4 --effort max)
+const argv = process.argv.slice(2);
+const flags: Record<string, string> = {};
+for (let i = 0; i < argv.length; i += 1) {
+  const arg = argv[i]!;
+  if (arg.startsWith("--")) {
+    const key = arg.slice(2);
+    const next = argv[i + 1];
+    if (next && !next.startsWith("-")) {
+      flags[key] = next;
+      i += 1;
+    }
+  }
+}
 
 const config = await new ConfigLoader({
   cwd: process.cwd(),
   homeDir: homedir(),
   env: process.env,
+  flags: {
+    ...(flags.model ? { model: flags.model } : {}),
+    ...(flags.effort && (flags.effort === "low" || flags.effort === "medium" || flags.effort === "high" || flags.effort === "max")
+      ? { effort: flags.effort }
+      : {}),
+    ...(flags.provider === "hf" || flags.provider === "local" ? { provider: flags.provider } : {}),
+  },
 }).resolve();
+
+const preset = resolvePreset(config.model, config.effort);
 
 async function makeProvider(): Promise<Provider> {
   if (config.provider === "local") {
-    return new LocalProvider({ modelId: config.model });
+    return new LocalProvider({ modelId: preset.id });
   }
   const token = await new SecretResolver({ env: process.env }).resolve(
     new SecretRef("HF_TOKEN"),
@@ -34,7 +59,11 @@ async function makeProvider(): Promise<Provider> {
       "HF_TOKEN is not set; run `t3os auth login` or `t3os auth set <token>`",
     );
   }
-  return new HuggingFaceProvider({ model: config.model, token });
+  return new HuggingFaceProvider({
+    model: preset.id,
+    token,
+    contextLength: preset.contextLength,
+  });
 }
 
 let provider: Provider;
@@ -61,7 +90,7 @@ await startRepl({
   sessionId: session.id,
   policy: createPolicy(config.permissionMode),
   root: config.projectRoot,
-  model: config.model,
+  model: `${preset.id} (${config.effort})`,
   onOpenToken: () => {
     openBrowser(HF_TOKEN_URL);
   },

@@ -1,4 +1,5 @@
 import type { PermissionMode } from "../types.js";
+import type { EffortLevel } from "../presets/index.js";
 
 export interface McpServerConfig {
   transport: "stdio" | "sse";
@@ -10,6 +11,7 @@ export interface McpServerConfig {
 export interface ConfigFile {
   model?: string;
   provider?: "hf" | "local";
+  effort?: EffortLevel;
   permissionMode?: PermissionMode;
   toolAllow?: string[];
   toolDeny?: string[];
@@ -23,6 +25,7 @@ export interface ConfigFile {
 export interface ResolvedConfig {
   model: string;
   provider: "hf" | "local";
+  effort: EffortLevel;
   permissionMode: PermissionMode;
   toolAllow: string[];
   toolDeny: string[];
@@ -35,8 +38,9 @@ export interface ResolvedConfig {
 }
 
 export const DEFAULTS: Omit<ResolvedConfig, "sessionDir" | "projectRoot"> = {
-  model: "google/gemma-2-9b-it",
+  model: "google/gemma-4-31B-it",
   provider: "hf",
+  effort: "high",
   permissionMode: "ask",
   toolAllow: [],
   toolDeny: [],

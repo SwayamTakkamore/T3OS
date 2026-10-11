@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { PermissionMode } from "../types.js";
+import type { EffortLevel } from "../presets/index.js";
 import { sessionsDir } from "../sessions/paths.js";
 import { DEFAULTS, type ConfigFile, type ResolvedConfig } from "./types.js";
 
@@ -23,6 +24,9 @@ function fromEnv(env: NodeJS.ProcessEnv): ConfigFile {
   const out: ConfigFile = {};
   if (env.T3OS_MODEL) out.model = env.T3OS_MODEL;
   if (env.T3OS_PROVIDER === "hf" || env.T3OS_PROVIDER === "local") out.provider = env.T3OS_PROVIDER;
+  if (env.T3OS_EFFORT === "low" || env.T3OS_EFFORT === "medium" || env.T3OS_EFFORT === "high" || env.T3OS_EFFORT === "max") {
+    out.effort = env.T3OS_EFFORT as EffortLevel;
+  }
   if (env.T3OS_PERMISSION_MODE) out.permissionMode = env.T3OS_PERMISSION_MODE as PermissionMode;
   if (env.T3OS_MAX_TURNS) out.maxTurns = Number(env.T3OS_MAX_TURNS);
   if (env.T3OS_LOOP_THRESHOLD) out.loopThreshold = Number(env.T3OS_LOOP_THRESHOLD);
@@ -56,6 +60,7 @@ export class ConfigLoader {
     return {
       model: pick("model") ?? DEFAULTS.model,
       provider: pick("provider") ?? DEFAULTS.provider,
+      effort: pick("effort") ?? DEFAULTS.effort,
       permissionMode: pick("permissionMode") ?? DEFAULTS.permissionMode,
       toolAllow: listMerge(pick("toolAllow"), undefined),
       toolDeny: listMerge(pick("toolDeny"), undefined),
@@ -64,7 +69,7 @@ export class ConfigLoader {
       maxTurns: pick("maxTurns") ?? DEFAULTS.maxTurns,
       loopThreshold: pick("loopThreshold") ?? DEFAULTS.loopThreshold,
       theme: pick("theme") ?? DEFAULTS.theme,
-      projectRoot: cwd
+      projectRoot: cwd,
     };
   }
 }
