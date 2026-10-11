@@ -16,9 +16,28 @@ body {
 }
 
 #t3os header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
   padding: 0.75rem 1rem;
   border-bottom: 1px solid #2a2c36;
   font-weight: 600;
+}
+
+#t3os #get-token {
+  background: #2b2e3b;
+  border: 1px solid #3d4152;
+  color: #ffbd59;
+  font-size: 0.8rem;
+  padding: 0.35rem 0.7rem;
+  border-radius: 4px;
+  cursor: pointer;
+  font-weight: 500;
+  transition: background 0.15s ease;
+}
+
+#t3os #get-token:hover {
+  background: #393d4e;
 }
 
 #t3os .transcript {

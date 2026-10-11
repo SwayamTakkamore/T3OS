@@ -2,6 +2,7 @@
 import { homedir } from "node:os";
 import {
   ConfigLoader,
+  HF_TOKEN_URL,
   HuggingFaceProvider,
   LocalProvider,
   SecretRef,
@@ -10,6 +11,7 @@ import {
   T3osError,
   builtInTools,
   createPolicy,
+  openBrowser,
   runTurn as runTurnCore,
   type Provider,
 } from "@t3os/core";
@@ -20,7 +22,13 @@ async function makeProvider(model: string, kind: "hf" | "local"): Promise<Provid
   if (kind === "local") return new LocalProvider({ modelId: model });
   const token = await new SecretResolver({ env: process.env }).resolve(new SecretRef("HF_TOKEN"));
   if (!token) {
-    throw new T3osError("config", "HF_TOKEN is not set; run `t3os auth set <token>`");
+    const opened = openBrowser(HF_TOKEN_URL);
+    console.error("HF_TOKEN is not set.");
+    console.error(
+      `Create one at ${HF_TOKEN_URL}${opened ? " (opening your browser…)" : ""}`
+    );
+    console.error("Then run `t3os auth login` or set HF_TOKEN to store it.");
+    throw new T3osError("config", "HF_TOKEN is not set; run `t3os auth login` or `t3os auth set <token>`");
   }
   return new HuggingFaceProvider({ model, token });
 }

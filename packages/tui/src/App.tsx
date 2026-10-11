@@ -15,6 +15,7 @@ export interface AppProps {
   busy?: boolean;
   permission?: PendingPermission | null;
   onPermission: (outcome: ApprovalOutcome) => void;
+  onOpenToken?: () => void;
 }
 
 export function App({
@@ -24,10 +25,15 @@ export function App({
   busy = false,
   permission = null,
   onPermission,
+  onOpenToken,
 }: AppProps): React.ReactElement {
   const [input, setInput] = useState("");
 
   useInput((value, key) => {
+    if (key.ctrl && value === "t") {
+      onOpenToken?.();
+      return;
+    }
     if (permission) {
       if (value === "y") onPermission("allow");
       else if (value === "a") onPermission("always");
@@ -90,6 +96,7 @@ export function App({
       ) : (
         <Text color="gray">› {input}</Text>
       )}
+      <Text dimColor>[ctrl+t] get HF token</Text>
     </Box>
   );
 }

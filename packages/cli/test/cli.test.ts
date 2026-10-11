@@ -2,7 +2,13 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { MockProvider, VERSION, type Delta, type Keyring } from "@t3os/core";
+import {
+  HF_TOKEN_URL,
+  MockProvider,
+  VERSION,
+  type Delta,
+  type Keyring,
+} from "@t3os/core";
 import { runCli, type CliDeps } from "../src/index.js";
 
 function memoryKeyring(): Keyring {
@@ -70,6 +76,48 @@ describe("runCli", () => {
     const second = await harness({ keyring });
     expect(await runCli(["auth", "status"], second.deps)).toBe(0);
     expect(second.out).toEqual(["HF_TOKEN: configured"]);
+  });
+
+  it("opens the token page and stores the token on auth login", async () => {
+    const keyring = memoryKeyring();
+    const opened: string[] = [];
+    const first = await harness({
+      keyring,
+      openBrowser: (url) => {
+        opened.push(url);
+        return true;
+      },
+      promptToken: async () => "hf_login_secret",
+    });
+    expect(await runCli(["auth", "login"], first.deps)).toBe(0);
+    expect(opened).toEqual([HF_TOKEN_URL]);
+    expect(first.out.join("\n")).toContain(HF_TOKEN_URL);
+    expect(first.out.join("\n")).not.toContain("hf_login_secret");
+    const second = await harness({ keyring });
+    expect(await runCli(["auth", "status"], second.deps)).toBe(0);
+    expect(second.out).toEqual(["HF_TOKEN: configured"]);
+  });
+
+  it("reports a browser failure but still accepts a pasted token", async () => {
+    const keyring = memoryKeyring();
+    const { deps, err } = await harness({
+      keyring,
+      openBrowser: () => false,
+      promptToken: async () => "hf_login_secret",
+    });
+    expect(await runCli(["auth", "login"], deps)).toBe(0);
+    expect(err.join("\n")).toContain("could not open a browser");
+  });
+
+  it("fails auth login when no token is provided", async () => {
+    const keyring = memoryKeyring();
+    const { deps, err } = await harness({
+      keyring,
+      openBrowser: () => true,
+      promptToken: async () => undefined,
+    });
+    expect(await runCli(["auth", "login"], deps)).toBe(1);
+    expect(err.join("\n")).toContain("no token provided");
   });
 
   it("writes and reads a project config value", async () => {

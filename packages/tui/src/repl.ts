@@ -25,6 +25,7 @@ export interface ReplOptions {
   root: string;
   model: string;
   onTurnEnd?: (reason: TurnEndReason) => void;
+  onOpenToken?: () => void;
 }
 
 export async function startRepl(options: ReplOptions): Promise<void> {
@@ -49,6 +50,7 @@ export async function startRepl(options: ReplOptions): Promise<void> {
         if (resolve) resolve(outcome);
         else draw();
       },
+      ...(options.onOpenToken ? { onOpenToken: options.onOpenToken } : {}),
     });
 
   const draw = (): void => {

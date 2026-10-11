@@ -1,8 +1,10 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { createInterface } from "node:readline/promises";
 import {
   ConfigLoader,
   GEMMA_PRESETS,
+  HF_TOKEN_URL,
   HuggingFaceProvider,
   LocalProvider,
   SecretRef,
@@ -12,6 +14,7 @@ import {
   VERSION,
   builtInTools,
   createPolicy,
+  openBrowser,
   runTurn,
   systemKeyring,
   type ConfigFile,
@@ -30,6 +33,8 @@ export interface CliDeps {
   err: (line: string) => void;
   keyring?: Keyring;
   makeProvider?: (config: ResolvedConfig, deps: CliDeps) => Promise<Provider>;
+  openBrowser?: (url: string) => boolean;
+  promptToken?: (question: string) => Promise<string | undefined>;
 }
 
 const USAGE = [
@@ -41,6 +46,7 @@ const USAGE = [
   "  models                   List the bundled Gemma presets",
   "  auth status              Report whether HF_TOKEN is configured",
   "  auth set <token>         Store HF_TOKEN in the system keyring",
+  "  auth login               Open the HF token page and store HF_TOKEN",
   "  config show              Print the resolved configuration",
   "  config get <key>         Print one resolved configuration value",
   "  config set <key> <value> Write a value to .t3os/config.json",
@@ -105,7 +111,10 @@ async function defaultProvider(
   }
   const token = await resolveToken(deps);
   if (!token) {
-    throw new T3osError("config", "HF_TOKEN is not set; run `t3os auth set <token>`");
+    throw new T3osError(
+      "config",
+      "HF_TOKEN is not set; run `t3os auth login` or `t3os auth set <token>`"
+    );
   }
   return new HuggingFaceProvider({ model: config.model, token });
 }
@@ -117,9 +126,36 @@ function cmdModels(deps: CliDeps): number {
   return 0;
 }
 
+async function promptForToken(question: string): Promise<string | undefined> {
+  const rl = createInterface({ input: process.stdin, output: process.stderr });
+  try {
+    const answer = await rl.question(question);
+    const trimmed = answer.trim();
+    return trimmed.length > 0 ? trimmed : undefined;
+  } finally {
+    rl.close();
+  }
+}
+
 async function cmdAuth(deps: CliDeps, args: string[]): Promise<number> {
   const sub = args[0];
   const keyring = deps.keyring ?? systemKeyring;
+  if (sub === "login") {
+    deps.out(`Create a HuggingFace token at ${HF_TOKEN_URL}`);
+    const opened = (deps.openBrowser ?? openBrowser)(HF_TOKEN_URL);
+    if (opened) deps.out("opening your browser…");
+    else deps.err(`could not open a browser; visit ${HF_TOKEN_URL}`);
+    const token = await (deps.promptToken ?? promptForToken)(
+      "Paste your HuggingFace token: "
+    );
+    if (!token) {
+      deps.err("no token provided");
+      return 1;
+    }
+    await keyring.set("HF_TOKEN", token);
+    deps.out("HF_TOKEN stored");
+    return 0;
+  }
   if (sub === "set") {
     const value = args[1];
     if (!value) {
@@ -212,7 +248,21 @@ async function cmdRun(
     return 1;
   }
   const config = await resolveConfig(deps, flags);
-  const provider = await (deps.makeProvider ?? defaultProvider)(config, deps);
+  let provider: Provider;
+  try {
+    provider = await (deps.makeProvider ?? defaultProvider)(config, deps);
+  } catch (error) {
+    if (error instanceof T3osError && error.message.includes("HF_TOKEN")) {
+      const opened = (deps.openBrowser ?? openBrowser)(HF_TOKEN_URL);
+      deps.err("HF_TOKEN is not set.");
+      deps.err(
+        `Create one at ${HF_TOKEN_URL}${opened ? " (opening your browser…)" : ""}`
+      );
+      deps.err("Then run `t3os auth login` or set HF_TOKEN to continue.");
+      return 1;
+    }
+    throw error;
+  }
   const store = new SessionStore(config.sessionDir);
   const session = await store.create(prompt.slice(0, 40));
   const result = await runTurn({

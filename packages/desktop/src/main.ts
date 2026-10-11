@@ -1,4 +1,4 @@
-import type { AgentEvent } from "@t3os/core";
+import { HF_TOKEN_URL, type AgentEvent } from "@t3os/core";
 import type { DesktopClient } from "./api.js";
 
 export interface MountDeps {
@@ -13,7 +13,10 @@ export function mountDesktop(deps: MountDeps): () => void {
 
   root.innerHTML = `
     <div id="t3os">
-      <header>t3os</header>
+      <header>
+        <span>t3os</span>
+        <button type="button" id="get-token">Get HF Token</button>
+      </header>
       <div class="transcript" id="transcript"></div>
       <footer>
         <input id="prompt" placeholder="Ask T3OS to do something..." />
@@ -56,8 +59,15 @@ export function mountDesktop(deps: MountDeps): () => void {
   };
   input?.addEventListener("keydown", onKeyDown);
 
+  const tokenButton = root.querySelector<HTMLButtonElement>("#get-token");
+  const onTokenClick = (): void => {
+    window.open(HF_TOKEN_URL, "_blank", "noopener");
+  };
+  tokenButton?.addEventListener("click", onTokenClick);
+
   return () => {
     input?.removeEventListener("keydown", onKeyDown);
+    tokenButton?.removeEventListener("click", onTokenClick);
     root.innerHTML = "";
   };
 }
