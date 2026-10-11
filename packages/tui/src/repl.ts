@@ -50,6 +50,10 @@ export async function startRepl(options: ReplOptions): Promise<void> {
         if (resolve) resolve(outcome);
         else draw();
       },
+      onClear: () => {
+        state = emptyTranscript();
+        draw();
+      },
       ...(options.onOpenToken ? { onOpenToken: options.onOpenToken } : {}),
     });
 
