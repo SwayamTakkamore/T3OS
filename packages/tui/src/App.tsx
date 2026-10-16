@@ -6,6 +6,7 @@ import {
   getModelEstimatedSize,
   installLocalModel,
   renderProgressBar,
+  resolveLocalModelId,
   type ApprovalOutcome,
   type DownloadProgress,
   type EffortLevel,
@@ -293,7 +294,7 @@ export function App({
           `Model ${target} downloaded, but switching to local mode failed`,
         );
         if (applied) {
-          setStatusMessage(`✓ Model ${target} downloaded and path set (${resolvedPath}). Switched to local mode.`);
+          setStatusMessage(`✓ Local ONNX model ${resolveLocalModelId(target)} downloaded and path set (${resolvedPath}). Switched to local mode.`);
         }
       } else {
         setLocalDialogStep("none");
@@ -986,13 +987,15 @@ export function App({
           paddingY={0}
           marginY={1}
         >
-          <Box justifyContent="space-between" marginY={0}>
+          <Box flexDirection="column" marginY={0}>
             <Text bold color="cyan">
-              Downloading Local Model: {pendingLocalModel || activeModel}
+              Downloading ONNX model {resolveLocalModelId(pendingLocalModel || activeModel)} ({pendingLocalModel || activeModel})…
             </Text>
-            <Text color="red">
-              [c] Cancel download
-            </Text>
+            <Box justifyContent="flex-end">
+              <Text color="red">
+                [c] Cancel download
+              </Text>
+            </Box>
           </Box>
           <Box marginY={0}>
             <Text color="cyan">
@@ -1022,6 +1025,13 @@ export function App({
               {downloadProgress?.formattedEta ?? "--"}
             </Text>
           </Box>
+          {downloadProgress?.statusText ? (
+            <Box marginY={0}>
+              <Text color="gray">
+                {downloadProgress.statusText}
+              </Text>
+            </Box>
+          ) : null}
         </Box>
       ) : null}
 

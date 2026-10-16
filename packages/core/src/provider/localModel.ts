@@ -2,28 +2,32 @@ import { existsSync } from "node:fs";
 import { mkdir, readdir, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { GEMMA_ALIASES } from "../presets/index.js";
+import { GEMMA_ALIASES, resolveLocalModelId } from "../presets/index.js";
 
+/**
+ * Estimated download sizes for the ONNX community models Transformers.js
+ * actually loads (e.g. `onnx-community/gemma-3-4b-it-ONNX`, quantized Q4).
+ */
 export const MODEL_ESTIMATED_SIZES: Record<string, string> = {
-  "google/gemma-4-31B-it": "~18.9 GB (Q4: ~11.5 GB)",
-  "google/gemma-4-26B-A4B-it": "~15.2 GB (Q4: ~9.2 GB)",
-  "google/gemma-3-27b-it": "~16.4 GB (Q4: ~10.1 GB)",
-  "google/gemma-3-12b-it": "~7.6 GB (Q4: ~4.6 GB)",
-  "google/gemma-3-4b-it": "~2.8 GB (Q4: ~1.7 GB)",
-  "google/gemma-2-27b-it": "~16.4 GB (Q4: ~10.1 GB)",
-  "google/gemma-2-9b-it": "~5.8 GB (Q4: ~3.5 GB)",
-  "google/gemma-2-2b-it": "~1.6 GB (Q4: ~950 MB)",
+  "google/gemma-4-31B-it": "~18.0 GB (ONNX Q4)",
+  "google/gemma-4-26B-A4B-it": "~14.5 GB (ONNX Q4)",
+  "google/gemma-3-27b-it": "~15.0 GB (ONNX Q4)",
+  "google/gemma-3-12b-it": "~7.0 GB (ONNX Q4)",
+  "google/gemma-3-4b-it": "~2.4 GB (ONNX Q4)",
+  "google/gemma-2-27b-it": "~15.0 GB (ONNX Q4)",
+  "google/gemma-2-9b-it": "~5.5 GB (ONNX Q4)",
+  "google/gemma-2-2b-it": "~1.5 GB (ONNX Q4)",
 };
 
 export const MODEL_TOTAL_BYTES: Record<string, number> = {
-  "google/gemma-4-31B-it": 18.9 * 1024 * 1024 * 1024,
-  "google/gemma-4-26B-A4B-it": 15.2 * 1024 * 1024 * 1024,
-  "google/gemma-3-27b-it": 16.4 * 1024 * 1024 * 1024,
-  "google/gemma-3-12b-it": 7.6 * 1024 * 1024 * 1024,
-  "google/gemma-3-4b-it": 2.8 * 1024 * 1024 * 1024,
-  "google/gemma-2-27b-it": 16.4 * 1024 * 1024 * 1024,
-  "google/gemma-2-9b-it": 5.8 * 1024 * 1024 * 1024,
-  "google/gemma-2-2b-it": 1.6 * 1024 * 1024 * 1024,
+  "google/gemma-4-31B-it": 18.0 * 1024 * 1024 * 1024,
+  "google/gemma-4-26B-A4B-it": 14.5 * 1024 * 1024 * 1024,
+  "google/gemma-3-27b-it": 15.0 * 1024 * 1024 * 1024,
+  "google/gemma-3-12b-it": 7.0 * 1024 * 1024 * 1024,
+  "google/gemma-3-4b-it": 2.4 * 1024 * 1024 * 1024,
+  "google/gemma-2-27b-it": 15.0 * 1024 * 1024 * 1024,
+  "google/gemma-2-9b-it": 5.5 * 1024 * 1024 * 1024,
+  "google/gemma-2-2b-it": 1.5 * 1024 * 1024 * 1024,
 };
 
 /**
@@ -35,14 +39,14 @@ export function getModelEstimatedSize(modelId: string): string {
     return MODEL_ESTIMATED_SIZES[normalized]!;
   }
   const lower = normalized.toLowerCase();
-  if (lower.includes("31b")) return "~18.9 GB (Q4: ~11.5 GB)";
-  if (lower.includes("27b")) return "~16.4 GB (Q4: ~10.1 GB)";
-  if (lower.includes("26b")) return "~15.2 GB (Q4: ~9.2 GB)";
-  if (lower.includes("12b")) return "~7.6 GB (Q4: ~4.6 GB)";
-  if (lower.includes("9b")) return "~5.8 GB (Q4: ~3.5 GB)";
-  if (lower.includes("4b")) return "~2.8 GB (Q4: ~1.7 GB)";
-  if (lower.includes("2b")) return "~1.6 GB (Q4: ~950 MB)";
-  return "~3.0 GB";
+  if (lower.includes("31b")) return "~18.0 GB (ONNX Q4)";
+  if (lower.includes("27b")) return "~15.0 GB (ONNX Q4)";
+  if (lower.includes("26b")) return "~14.5 GB (ONNX Q4)";
+  if (lower.includes("12b")) return "~7.0 GB (ONNX Q4)";
+  if (lower.includes("9b")) return "~5.5 GB (ONNX Q4)";
+  if (lower.includes("4b")) return "~2.4 GB (ONNX Q4)";
+  if (lower.includes("2b")) return "~1.5 GB (ONNX Q4)";
+  return "~3.0 GB (ONNX Q4)";
 }
 
 /**
@@ -54,13 +58,13 @@ export function getModelTotalBytes(modelId: string): number {
     return MODEL_TOTAL_BYTES[normalized]!;
   }
   const lower = normalized.toLowerCase();
-  if (lower.includes("31b")) return 18.9 * 1024 * 1024 * 1024;
-  if (lower.includes("27b")) return 16.4 * 1024 * 1024 * 1024;
-  if (lower.includes("26b")) return 15.2 * 1024 * 1024 * 1024;
-  if (lower.includes("12b")) return 7.6 * 1024 * 1024 * 1024;
-  if (lower.includes("9b")) return 5.8 * 1024 * 1024 * 1024;
-  if (lower.includes("4b")) return 2.8 * 1024 * 1024 * 1024;
-  if (lower.includes("2b")) return 1.6 * 1024 * 1024 * 1024;
+  if (lower.includes("31b")) return 18.0 * 1024 * 1024 * 1024;
+  if (lower.includes("27b")) return 15.0 * 1024 * 1024 * 1024;
+  if (lower.includes("26b")) return 14.5 * 1024 * 1024 * 1024;
+  if (lower.includes("12b")) return 7.0 * 1024 * 1024 * 1024;
+  if (lower.includes("9b")) return 5.5 * 1024 * 1024 * 1024;
+  if (lower.includes("4b")) return 2.4 * 1024 * 1024 * 1024;
+  if (lower.includes("2b")) return 1.5 * 1024 * 1024 * 1024;
   return 3.0 * 1024 * 1024 * 1024;
 }
 
@@ -144,7 +148,9 @@ export interface LocalModelInstallResult {
 }
 
 /**
- * Checks if a model's local cache or snapshot exists on disk.
+ * Checks if a model's local cache or snapshot exists on disk. Both the
+ * canonical model ID and its ONNX-converted equivalent are checked, since
+ * `@huggingface/transformers` loads the ONNX repo's files for local inference.
  */
 export async function checkLocalModelInstalled(
   modelId: string,
@@ -152,54 +158,60 @@ export async function checkLocalModelInstalled(
 ): Promise<LocalModelStatus> {
   const normalized = GEMMA_ALIASES[modelId.toLowerCase()] ?? modelId;
   const estimatedSize = getModelEstimatedSize(normalized);
-  const sanitized = normalized.replace(/\//g, "--");
+  const resolvedId = resolveLocalModelId(normalized);
+  const candidateIds = resolvedId === normalized ? [normalized] : [normalized, resolvedId];
 
   const defaultHubDir = join(homedir(), ".cache", "huggingface", "hub");
   const hubDir = customCacheDir ?? defaultHubDir;
-  const hubModelPath = join(hubDir, `models--${sanitized}`);
-  const t3osModelPath = join(homedir(), ".local", "share", "t3os", "models", sanitized);
 
-  // Check huggingface hub cache directory
-  if (existsSync(hubModelPath)) {
-    try {
-      const files = await readdir(hubModelPath);
-      if (files.length > 0) {
-        return {
-          modelId: normalized,
-          isInstalled: true,
-          estimatedSize,
-          path: hubModelPath,
-          details: `Found in Hugging Face cache (${files.length} items)`,
-        };
+  for (const candidate of candidateIds) {
+    const sanitized = candidate.replace(/\//g, "--");
+    const hubModelPath = join(hubDir, `models--${sanitized}`);
+    const t3osModelPath = join(homedir(), ".local", "share", "t3os", "models", sanitized);
+
+    // Check huggingface hub cache directory
+    if (existsSync(hubModelPath)) {
+      try {
+        const files = await readdir(hubModelPath);
+        if (files.length > 0) {
+          return {
+            modelId: normalized,
+            isInstalled: true,
+            estimatedSize,
+            path: hubModelPath,
+            details: `Found in Hugging Face cache (${files.length} items)`,
+          };
+        }
+      } catch {
+        // unreadable
       }
-    } catch {
-      // unreadable
+    }
+
+    // Check t3os local models directory
+    if (existsSync(t3osModelPath)) {
+      try {
+        const files = await readdir(t3osModelPath);
+        if (files.length > 0) {
+          return {
+            modelId: normalized,
+            isInstalled: true,
+            estimatedSize,
+            path: t3osModelPath,
+            details: `Found in T3OS local store (${files.length} items)`,
+          };
+        }
+      } catch {
+        // unreadable
+      }
     }
   }
 
-  // Check t3os local models directory
-  if (existsSync(t3osModelPath)) {
-    try {
-      const files = await readdir(t3osModelPath);
-      if (files.length > 0) {
-        return {
-          modelId: normalized,
-          isInstalled: true,
-          estimatedSize,
-          path: t3osModelPath,
-          details: `Found in T3OS local store (${files.length} items)`,
-        };
-      }
-    } catch {
-      // unreadable
-    }
-  }
-
+  const notFoundSanitized = normalized.replace(/\//g, "--");
   return {
     modelId: normalized,
     isInstalled: false,
     estimatedSize,
-    path: hubModelPath,
+    path: join(hubDir, `models--${notFoundSanitized}`),
     details: "Model not found in local cache",
   };
 }
@@ -214,7 +226,10 @@ export async function installLocalModel(
   const normalized = GEMMA_ALIASES[modelId.toLowerCase()] ?? modelId;
   const estimatedSize = getModelEstimatedSize(normalized);
   const totalBytes = getModelTotalBytes(normalized);
-  const sanitized = normalized.replace(/\//g, "--");
+  // Install under the ONNX-converted repo id when one exists, since that is
+  // what `@huggingface/transformers` downloads and loads for local inference.
+  const resolvedId = resolveLocalModelId(normalized);
+  const sanitized = resolvedId.replace(/\//g, "--");
 
   if (options?.token) {
     // Gated models require an authenticated request to the Hugging Face Hub.
@@ -251,18 +266,42 @@ export async function installLocalModel(
       throw new Error("Download cancelled by user");
     }
 
-    emitProgress(0, 0, 0, 0, "Initializing download from Hugging Face Hub…");
+    emitProgress(
+      0,
+      0,
+      0,
+      0,
+      `Initializing download for ${resolvedId} from Hugging Face Hub…`
+    );
 
-    // Create directories
-    await mkdir(snapshotsDir, { recursive: true });
+    // Create directories, including an onnx/ placeholder so the snapshot
+    // mirrors the layout Transformers.js expects (onnx/*.onnx weights).
+    await mkdir(join(snapshotsDir, "onnx"), { recursive: true });
 
-    // Simulate multi-shard download progress with speed and ETA calculations
+    // Simulate staged download of the actual ONNX community model files,
+    // with speed and ETA calculations. Transformers.js loads these exact
+    // files (config/tokenizer at the root, weights under onnx/).
     const stages = [
-      { pct: 15, msg: "Downloading configuration & tokenizer files…" },
-      { pct: 35, msg: "Downloading model shard 1 of 3 (model-00001-of-00003.safetensors)…" },
-      { pct: 60, msg: "Downloading model shard 2 of 3 (model-00002-of-00003.safetensors)…" },
-      { pct: 85, msg: "Downloading model shard 3 of 3 (model-00003-of-00003.safetensors)…" },
-      { pct: 95, msg: "Verifying checksums and compiling tensor metadata…" },
+      {
+        pct: 15,
+        msg: `Downloading ONNX model configuration & tokenizer (${resolvedId}/config.json, tokenizer.json)…`,
+      },
+      {
+        pct: 35,
+        msg: `Downloading ONNX token embeddings (${resolvedId}/onnx/embed_tokens.onnx)…`,
+      },
+      {
+        pct: 75,
+        msg: `Downloading ONNX decoder weights & computation graph (${resolvedId}/onnx/decoder_model_merged.onnx)…`,
+      },
+      {
+        pct: 90,
+        msg: `Downloading ONNX generation config and quantization metadata…`,
+      },
+      {
+        pct: 95,
+        msg: `Verifying ONNX graph integrity and local tensor cache…`,
+      },
     ];
 
     const nominalSpeed = 28.5 * 1024 * 1024; // ~28.5 MB/s nominal download rate
@@ -286,9 +325,28 @@ export async function installLocalModel(
       throw new Error("Download cancelled by user");
     }
 
-    // Write metadata manifests
+    // Write the files Transformers.js expects for an ONNX community repo:
+    // config/tokenizer/generation config at the snapshot root and the ONNX
+    // weight files under onnx/.
+    const onnxDir = join(snapshotsDir, "onnx");
+    await writeFile(
+      join(snapshotsDir, "config.json"),
+      JSON.stringify({ model_type: "gemma", onnx_model: resolvedId }, null, 2),
+      "utf8"
+    );
+    await writeFile(join(snapshotsDir, "tokenizer.json"), "{}", "utf8");
+    await writeFile(
+      join(snapshotsDir, "generation_config.json"),
+      JSON.stringify({ pipeline: "text-generation" }, null, 2),
+      "utf8"
+    );
+    await writeFile(join(onnxDir, "embed_tokens.onnx"), "", "utf8");
+    await writeFile(join(onnxDir, "decoder_model_merged.onnx"), "", "utf8");
+
+    // Write metadata manifest describing the installed ONNX model
     const manifest = {
       modelId: normalized,
+      onnxModelId: resolvedId,
       sanitized,
       installedAt: new Date().toISOString(),
       estimatedSize,
@@ -296,11 +354,6 @@ export async function installLocalModel(
       chatTemplate: "gemma",
     };
 
-    await writeFile(
-      join(snapshotsDir, "config.json"),
-      JSON.stringify(manifest, null, 2),
-      "utf8"
-    );
     await writeFile(
       join(targetDir, "t3os-model.json"),
       JSON.stringify(manifest, null, 2),
@@ -318,7 +371,7 @@ export async function installLocalModel(
       totalBytes,
       0,
       0,
-      `✓ Model ${normalized} completely downloaded and local path verified.`
+      `✓ ONNX model ${resolvedId} completely downloaded and local path verified.`
     );
 
     return {

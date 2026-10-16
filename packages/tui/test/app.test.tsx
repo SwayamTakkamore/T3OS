@@ -83,7 +83,7 @@ describe("App", () => {
         formattedEta: "42s remaining",
         formattedDownloaded: "1.68 GB",
         formattedTotal: "2.80 GB",
-        statusText: "Downloading model shard 2 of 3…",
+        statusText: "Downloading ONNX token embeddings (onnx-community/gemma-3-4b-it-ONNX/onnx/embed_tokens.onnx)…",
       });
       return Promise.resolve(true);
     });
@@ -143,7 +143,7 @@ describe("App", () => {
     // 6. Verify Step 2: Since not installed, asks if want to install with estimated file size!
     frame = lastFrame();
     expect(frame).toContain("Local Model Not Installed");
-    expect(frame).toContain("Estimated download size: ~2.8 GB");
+    expect(frame).toContain("Estimated download size: ~2.4 GB");
     expect(frame).toContain("[y] Install & Switch to Local");
 
     // 7. Confirm installation by pressing 'y'
@@ -152,6 +152,13 @@ describe("App", () => {
 
     expect(onInstallModel).toHaveBeenCalled();
     expect(onChangeProvider).toHaveBeenCalledWith("local");
+
+    // 8. Success status message references the actual ONNX community model
+    await tick(100);
+    frame = lastFrame();
+    expect(frame).toContain("Local ONNX model onnx-community/gemma-3-4b-it-ONNX");
+    expect(frame).toContain("downloaded and path set");
+    expect(frame).toContain("local mode.");
   });
 
   it("shows download progress bar, speed, ETA, and allows cancelling with confirmation", async () => {
@@ -220,13 +227,14 @@ describe("App", () => {
       formattedEta: "45s remaining",
       formattedDownloaded: "1.51 GB",
       formattedTotal: "2.80 GB",
-      statusText: "Downloading model shards…",
+      statusText: "Downloading ONNX token embeddings (onnx-community/gemma-3-4b-it-ONNX/onnx/embed_tokens.onnx)…",
     });
     await tick(100);
 
     // Verify progress bar, speed, ETA and cancel option are shown
     let frame = lastFrame();
-    expect(frame).toContain("Downloading Local Model");
+    expect(frame).toContain("Downloading ONNX model onnx-community/gemma-3-4b-it-ONNX (google/gemma-3-4b-it)");
+    expect(frame).toContain("Downloading ONNX token embeddings");
     expect(frame).toContain("54%");
     expect(frame).toContain("28.4 MB/s");
     expect(frame).toContain("45s remaining");
@@ -313,7 +321,7 @@ describe("App", () => {
       formattedEta: "1m 7s remaining",
       formattedDownloaded: "1.12 GB",
       formattedTotal: "2.80 GB",
-      statusText: "Downloading shard 1…",
+      statusText: "Downloading ONNX decoder weights & computation graph (onnx-community/gemma-3-4b-it-ONNX/onnx/decoder_model_merged.onnx)…",
     });
     await tick(100);
 
@@ -329,7 +337,7 @@ describe("App", () => {
 
     // Should be back to downloading view!
     frame = lastFrame();
-    expect(frame).toContain("Downloading Local Model");
+    expect(frame).toContain("Downloading ONNX model onnx-community/gemma-3-4b-it-ONNX");
     expect(frame).toContain("40%");
   });
 

@@ -1,5 +1,5 @@
 import { basename, dirname } from "node:path";
-import { resolvePreset, type ModelPreset } from "../presets/index.js";
+import { resolveLocalModelId, resolvePreset, type ModelPreset } from "../presets/index.js";
 import type { Delta, Message, ToolSchema } from "../types.js";
 import { checkLocalModelInstalled } from "./localModel.js";
 import type { Provider, ProviderCapabilities, StreamOptions } from "./types.js";
@@ -56,35 +56,67 @@ export type TransformersLoader = () => Promise<TransformersModule>;
 const GATED_MODEL_PATTERN = /unauthorized|401|403|forbidden|gated|access denied/i;
 
 /**
+ * Errors that indicate the repo lacks ONNX weights. Transformers.js is an
+ * ONNX runtime and resolves weights from the repo's `onnx/` subfolder, which
+ * standard safetensors-only checkpoints do not provide.
+ */
+const MISSING_ONNX_PATTERN =
+  /could not locate file.*\.onnx|entry not found.*\.onnx|404.*\.onnx|could not locate file:/i;
+
+/**
  * Formats a model-loading failure. Gated repositories (e.g. Gemma) surface as
  * `Unauthorized`/401/403 responses; for those we add guidance for accepting the
- * license and configuring an access token.
+ * license and configuring an access token. Missing ONNX weights (a raw
+ * safetensors-only repo handed to Transformers.js) get guidance pointing at the
+ * ONNX-converted repository instead.
  */
 function formatModelLoadError(modelId: string, err: unknown): Error {
   const message = err instanceof Error ? err.message : String(err);
   const base = `Failed to load model ${modelId} for local inference: ${message}`;
-  if (!GATED_MODEL_PATTERN.test(message)) return new Error(base);
-  return new Error(
-    `${base}\n` +
-      `${modelId} is a gated model on the Hugging Face Hub. Accept the license terms at ` +
-      `https://huggingface.co/${modelId} and authenticate with an access token, then run ` +
-      "`t3os auth login` (or `t3os auth set <token>`) to continue."
-  );
+  if (GATED_MODEL_PATTERN.test(message)) {
+    return new Error(
+      `${base}\n` +
+        `${modelId} is a gated model on the Hugging Face Hub. Accept the license terms at ` +
+        `https://huggingface.co/${modelId} and authenticate with an access token, then run ` +
+        "`t3os auth login` (or `t3os auth set <token>`) to continue."
+    );
+  }
+  if (MISSING_ONNX_PATTERN.test(message)) {
+    const onnxRepo = resolveLocalModelId(modelId);
+    const suggestion =
+      onnxRepo !== modelId
+        ? `Use the ONNX-converted repository "${onnxRepo}" instead, or verify that ` +
+          `https://huggingface.co/${modelId} provides ONNX weights under its onnx/ folder.`
+        : `Verify that https://huggingface.co/${modelId} provides ONNX weights under its ` +
+          `onnx/ folder — Transformers.js cannot load safetensors-only checkpoints.`;
+    return new Error(
+      `${base}\n` +
+        `Transformers.js runs models via ONNX and requires ONNX model files (e.g. ` +
+        `onnx/embed_tokens.onnx), which ${modelId} does not provide. ${suggestion}`
+    );
+  }
+  return new Error(base);
 }
 
 /**
  * Resolves the cache directory handed to `@huggingface/transformers`. An
  * explicit `cacheDir` always wins; otherwise a model already present in the
  * local Hugging Face hub cache is used so loading works without a round trip.
+ * Both the raw model ID and its ONNX-converted equivalent are checked, since
+ * the pipeline loads the resolved ONNX repo's files.
  */
 async function resolveCacheDir(
   modelId: string,
   explicitCacheDir?: string
 ): Promise<string | undefined> {
   if (explicitCacheDir) return explicitCacheDir;
-  const status = await checkLocalModelInstalled(modelId);
-  if (!status.isInstalled) return undefined;
-  return basename(status.path).startsWith("models--") ? dirname(status.path) : undefined;
+  const candidates = [modelId, resolveLocalModelId(modelId)];
+  for (const candidate of candidates) {
+    const status = await checkLocalModelInstalled(candidate);
+    if (!status.isInstalled) continue;
+    if (basename(status.path).startsWith("models--")) return dirname(status.path);
+  }
+  return undefined;
 }
 
 /**
@@ -118,11 +150,14 @@ async function transformersGenerate(
     );
   }
   const cacheDir = await resolveCacheDir(modelId, options.cacheDir);
+  // Transformers.js resolves weights from the repo's `onnx/` subfolder, so
+  // map to the ONNX-converted repository when the canonical repo lacks one.
+  const resolvedId = resolveLocalModelId(modelId);
   let generator: TextGenerator;
   try {
     generator = await mod.pipeline(
       "text-generation",
-      modelId,
+      resolvedId,
       cacheDir ? { cache_dir: cacheDir } : undefined
     );
   } catch (err) {
