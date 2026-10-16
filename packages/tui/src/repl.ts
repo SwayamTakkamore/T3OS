@@ -15,6 +15,12 @@ import {
 } from "@t3os/core";
 import { App, type PendingPermission } from "./App.js";
 import {
+  createSettingsController,
+  type SettingsController,
+  type SettingsSnapshot,
+  type SettingsUpdate,
+} from "./settings.js";
+import {
   emptyTranscript,
   reduceTranscript,
   type TranscriptState,
@@ -40,26 +46,85 @@ export interface ReplOptions {
   onUpdatePolicy?: (newMode: PermissionMode) => PermissionPolicy;
 }
 
+export interface ReplSettingsOptions {
+  provider: Provider;
+  model: string;
+  effort?: EffortLevel;
+  providerType?: "hf" | "local";
+  onUpdateProvider?: (
+    newModel: string,
+    newEffort: EffortLevel,
+    newProviderType: "hf" | "local"
+  ) => Promise<Provider>;
+  onCommit?: (snapshot: SettingsSnapshot) => void;
+}
+
+/**
+ * Builds the serialized settings controller backing the REPL. All model,
+ * effort and provider changes flow through it, so the active provider
+ * (`provider()`) always matches the latest committed settings even when
+ * updates are issued concurrently.
+ */
+export function createReplSettings(options: ReplSettingsOptions): SettingsController {
+  const createProvider = options.onUpdateProvider;
+  return createSettingsController({
+    initial: {
+      model: options.model,
+      effort: options.effort ?? "high",
+      providerType: options.providerType ?? "hf",
+    },
+    initialProvider: options.provider,
+    ...(createProvider
+      ? {
+          createProvider: (snapshot: SettingsSnapshot): Promise<Provider> =>
+            createProvider(snapshot.model, snapshot.effort, snapshot.providerType),
+        }
+      : {}),
+    ...(options.onCommit ? { onCommit: options.onCommit } : {}),
+  });
+}
+
 export async function startRepl(options: ReplOptions): Promise<void> {
   let state: TranscriptState = emptyTranscript();
   let busy = false;
   let pending: PendingPermission | null = null;
   let resolvePermission: ((outcome: ApprovalOutcome) => void) | null = null;
 
-  let currentProvider = options.provider;
   let currentPolicy = options.policy;
-  let currentModel = options.model;
-  let currentEffort = options.effort ?? "high";
   let currentPermissionMode = options.permissionMode ?? "ask";
-  let currentProviderType = options.providerType ?? "hf";
 
-  const view = (): React.ReactElement =>
-    React.createElement(App, {
+  // Single source of truth for model/effort/provider. All mutations go through
+  // applySettings so concurrent changes are serialized and the active provider
+  // always matches the latest settings.
+  const settings = createReplSettings({
+    provider: options.provider,
+    model: options.model,
+    ...(options.effort ? { effort: options.effort } : {}),
+    ...(options.providerType ? { providerType: options.providerType } : {}),
+    ...(options.onUpdateProvider ? { onUpdateProvider: options.onUpdateProvider } : {}),
+  });
+
+  /**
+   * Awaits a settings update and redraws. Resolves only when the provider for
+   * the requested settings is active; rejects (without disturbing the active
+   * provider) when provider creation fails.
+   */
+  const applySettings = async (update: SettingsUpdate): Promise<void> => {
+    try {
+      await settings.applySettings(update);
+    } finally {
+      draw();
+    }
+  };
+
+  const view = (): React.ReactElement => {
+    const snapshot = settings.committed();
+    return React.createElement(App, {
       state,
-      model: currentModel,
-      effort: currentEffort,
+      model: snapshot.model,
+      effort: snapshot.effort,
       permissionMode: currentPermissionMode,
-      providerType: currentProviderType,
+      providerType: snapshot.providerType,
       busy,
       permission: pending,
       onSubmit: (text: string) => {
@@ -76,51 +141,11 @@ export async function startRepl(options: ReplOptions): Promise<void> {
         state = emptyTranscript();
         draw();
       },
-      onChangeModel: async (newModel: string) => {
-        currentModel = newModel;
-        if (options.onUpdateProvider) {
-          try {
-            currentProvider = await options.onUpdateProvider(
-              currentModel,
-              currentEffort,
-              currentProviderType
-            );
-          } catch {
-            // Keep existing provider if re-creation fails
-          }
-        }
-        draw();
-      },
-      onChangeEffort: async (newEffort: EffortLevel) => {
-        currentEffort = newEffort;
-        if (options.onUpdateProvider) {
-          try {
-            currentProvider = await options.onUpdateProvider(
-              currentModel,
-              currentEffort,
-              currentProviderType
-            );
-          } catch {
-            // Keep existing provider if re-creation fails
-          }
-        }
-        draw();
-      },
-      onChangeProvider: async (newType: "hf" | "local") => {
-        currentProviderType = newType;
-        if (options.onUpdateProvider) {
-          try {
-            currentProvider = await options.onUpdateProvider(
-              currentModel,
-              currentEffort,
-              currentProviderType
-            );
-          } catch {
-            // Keep existing provider if re-creation fails
-          }
-        }
-        draw();
-      },
+      onChangeSettings: applySettings,
+      onChangeModel: (newModel: string) => applySettings({ model: newModel }),
+      onChangeEffort: (newEffort: EffortLevel) => applySettings({ effort: newEffort }),
+      onChangeProvider: (newType: "hf" | "local") =>
+        applySettings({ provider: newType }),
       onChangePermissionMode: (newMode: PermissionMode) => {
         currentPermissionMode = newMode;
         if (options.onUpdatePolicy) {
@@ -132,6 +157,7 @@ export async function startRepl(options: ReplOptions): Promise<void> {
       },
       ...(options.onOpenToken ? { onOpenToken: options.onOpenToken } : {}),
     });
+  };
 
   const draw = (): void => {
     instance.rerender(view());
@@ -144,7 +170,7 @@ export async function startRepl(options: ReplOptions): Promise<void> {
     state = reduceTranscript(state, { type: "user_message", text });
     draw();
     const result = await runTurn({
-      provider: currentProvider,
+      provider: settings.provider(),
       store: options.store,
       sessionId: options.sessionId,
       policy: currentPolicy,

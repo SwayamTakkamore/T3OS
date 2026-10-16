@@ -333,6 +333,112 @@ describe("App", () => {
     expect(frame).toContain("40%");
   });
 
+  it("switches to local atomically through onChangeSettings when the model is installed", async () => {
+    const state = emptyTranscript();
+    const onChangeSettings = vi.fn().mockResolvedValue(undefined);
+    const onChangeModel = vi.fn();
+    const onChangeProvider = vi.fn();
+    const onCheckModelInstalled = vi.fn().mockResolvedValue(true);
+
+    const { stdin, lastFrame } = render(
+      <App
+        state={state}
+        model="google/gemma-3-4b-it"
+        effort="high"
+        providerType="hf"
+        onSubmit={() => {}}
+        onPermission={() => {}}
+        onChangeSettings={onChangeSettings}
+        onChangeModel={onChangeModel}
+        onChangeProvider={onChangeProvider}
+        onCheckModelInstalled={onCheckModelInstalled}
+      />,
+    );
+
+    await tick(100);
+
+    // Settings > AI Provider > Hugging Face (Local)
+    stdin.write("\x10");
+    await tick(100);
+    stdin.write("\u001B[B"); // 1
+    await tick(50);
+    stdin.write("\u001B[B"); // 2
+    await tick(50);
+    stdin.write("\u001B[B"); // 3 (AI Provider)
+    await tick(50);
+    stdin.write("\r");
+    await tick(100);
+    stdin.write("\u001B[B"); // Local
+    await tick(50);
+    stdin.write("\r");
+    await tick(100);
+
+    // Confirm the switch (the model is already installed).
+    stdin.write("y");
+    await tick(150);
+
+    expect(onCheckModelInstalled).toHaveBeenCalledWith("google/gemma-3-4b-it");
+    expect(onChangeSettings).toHaveBeenCalledTimes(1);
+    expect(onChangeSettings).toHaveBeenCalledWith({ provider: "local" });
+    // No redundant model update and no legacy granular callbacks.
+    expect(onChangeModel).not.toHaveBeenCalled();
+    expect(onChangeProvider).not.toHaveBeenCalled();
+
+    const frame = lastFrame();
+    expect(frame).toContain("[LOCAL]");
+    expect(frame).toContain("Switched to local mode");
+  });
+
+  it("surfaces an atomic provider switch failure and reverts the header to Cloud", async () => {
+    const state = emptyTranscript();
+    const onChangeSettings = vi
+      .fn()
+      .mockRejectedValue(new Error("local engine unavailable"));
+    const onCheckModelInstalled = vi.fn().mockResolvedValue(true);
+
+    const { stdin, lastFrame } = render(
+      <App
+        state={state}
+        model="google/gemma-3-4b-it"
+        effort="high"
+        providerType="hf"
+        onSubmit={() => {}}
+        onPermission={() => {}}
+        onChangeSettings={onChangeSettings}
+        onCheckModelInstalled={onCheckModelInstalled}
+      />,
+    );
+
+    await tick(100);
+
+    // Settings > AI Provider > Hugging Face (Local)
+    stdin.write("\x10");
+    await tick(100);
+    stdin.write("\u001B[B"); // 1
+    await tick(50);
+    stdin.write("\u001B[B"); // 2
+    await tick(50);
+    stdin.write("\u001B[B"); // 3 (AI Provider)
+    await tick(50);
+    stdin.write("\r");
+    await tick(100);
+    stdin.write("\u001B[B"); // Local
+    await tick(50);
+    stdin.write("\r");
+    await tick(100);
+
+    // Confirm the switch; the provider factory rejects.
+    stdin.write("y");
+    await tick(150);
+
+    const frame = lastFrame();
+    // The header must not claim [LOCAL] while the cloud provider is active.
+    expect(frame).toContain("[CLOUD]");
+    expect(frame).not.toContain("[LOCAL]");
+    expect(frame).toContain("✖");
+    expect(frame).toContain("local engine unavailable");
+  });
+
   it("cancels switch to local model when declined", async () => {
     const state = emptyTranscript();
     const onChangeProvider = vi.fn();

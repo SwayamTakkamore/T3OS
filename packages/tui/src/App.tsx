@@ -12,6 +12,7 @@ import {
   type PermissionMode,
   type PermissionRequest,
 } from "@t3os/core";
+import type { SettingsUpdate } from "./settings.js";
 import type { TranscriptState } from "./transcript.js";
 
 export interface PendingPermission {
@@ -46,10 +47,17 @@ export interface AppProps {
   onPermission: (outcome: ApprovalOutcome) => void;
   onOpenToken?: () => void;
   onClear?: () => void;
-  onChangeModel?: (model: string) => void;
-  onChangeEffort?: (effort: EffortLevel) => void;
+  /**
+   * Applies model/effort/provider changes atomically and serialized. Preferred
+   * over the granular callbacks below because it cannot race: awaiting it
+   * guarantees the active provider matches the requested settings, and a
+   * rejection means the change was not applied.
+   */
+  onChangeSettings?: (update: SettingsUpdate) => Promise<void>;
+  onChangeModel?: (model: string) => void | Promise<void>;
+  onChangeEffort?: (effort: EffortLevel) => void | Promise<void>;
   onChangePermissionMode?: (mode: PermissionMode) => void;
-  onChangeProvider?: (provider: "hf" | "local") => void;
+  onChangeProvider?: (provider: "hf" | "local") => void | Promise<void>;
   onCheckModelInstalled?: (model: string) => Promise<boolean>;
   onInstallModel?: (model: string, onProgress: (progress: DownloadProgress) => void, signal?: AbortSignal) => Promise<boolean>;
 }
@@ -72,6 +80,7 @@ export function App({
   onChangeEffort,
   onChangePermissionMode,
   onChangeProvider,
+  onChangeSettings,
   onCheckModelInstalled,
   onInstallModel,
 }: AppProps): React.ReactElement {
@@ -128,6 +137,49 @@ export function App({
     setIsSettingsOpen(false);
   };
 
+  /**
+   * Applies a settings change atomically (via `onChangeSettings` when
+   * available) and reflects it in the header optimistically. If the change
+   * fails, the optimistic state is reverted to the last committed props so the
+   * UI never shows a provider that is not actually active, and the error is
+   * surfaced through `statusMessage`.
+   *
+   * Returns `true` when the change was applied.
+   */
+  const applySettingsChange = async (
+    update: SettingsUpdate,
+    failureContext: string,
+  ): Promise<boolean> => {
+    if (update.provider !== undefined) setActiveProviderType(update.provider);
+    if (update.model !== undefined) setActiveModel(update.model);
+    if (update.effort !== undefined) setActiveEffort(update.effort);
+
+    try {
+      if (onChangeSettings) {
+        await onChangeSettings(update);
+      } else {
+        // Legacy fallback: apply strictly in sequence so no callback ever
+        // observes a half-updated (and therefore stale) provider state.
+        if (update.model !== undefined) await onChangeModel?.(update.model);
+        if (update.effort !== undefined) await onChangeEffort?.(update.effort);
+        if (update.provider !== undefined) await onChangeProvider?.(update.provider);
+      }
+      return true;
+    } catch (err) {
+      setActiveProviderType(providerType);
+      setActiveModel(model);
+      setActiveEffort(effort);
+      const detail = err instanceof Error ? err.message : String(err);
+      setStatusMessage(`✖ ${failureContext}: ${detail}`);
+      return false;
+    }
+  };
+
+  /** Builds the atomic update for a switch to local mode, including the model
+   * only when it actually changes. */
+  const localSwitchUpdate = (target: string): SettingsUpdate =>
+    target === activeModel ? { provider: "local" } : { provider: "local", model: target };
+
   const handleConfirmSwitchToLocal = async () => {
     const target = pendingLocalModel || activeModel;
     setStatusMessage(`Checking local installation for ${target}…`);
@@ -137,12 +189,14 @@ export function App({
       : (await checkLocalModelInstalled(target)).isInstalled;
 
     if (isInstalled) {
-      setActiveProviderType("local");
-      setActiveModel(target);
-      onChangeModel?.(target);
-      onChangeProvider?.("local");
       setLocalDialogStep("none");
-      setStatusMessage(`✓ Local model ${target} is installed. Switched to local mode.`);
+      const applied = await applySettingsChange(
+        localSwitchUpdate(target),
+        `Failed to switch ${target} to local mode`,
+      );
+      if (applied) {
+        setStatusMessage(`✓ Local model ${target} is installed. Switched to local mode.`);
+      }
     } else {
       setLocalDialogStep("ask_install");
     }
@@ -184,12 +238,14 @@ export function App({
       if (success) {
         const verification = await checkLocalModelInstalled(target);
         const resolvedPath = verification.path || "configured";
-        setActiveProviderType("local");
-        setActiveModel(target);
-        onChangeModel?.(target);
-        onChangeProvider?.("local");
         setLocalDialogStep("none");
-        setStatusMessage(`✓ Model ${target} downloaded and path set (${resolvedPath}). Switched to local mode.`);
+        const applied = await applySettingsChange(
+          localSwitchUpdate(target),
+          `Model ${target} downloaded, but switching to local mode failed`,
+        );
+        if (applied) {
+          setStatusMessage(`✓ Model ${target} downloaded and path set (${resolvedPath}). Switched to local mode.`);
+        }
       } else {
         setLocalDialogStep("none");
         setStatusMessage(`✖ Installation of ${target} failed.`);
@@ -223,11 +279,14 @@ export function App({
               initiateLocalModelSwitch(preset.id);
               return;
             }
-            setActiveModel(preset.id);
-            onChangeModel?.(preset.id);
-            setStatusMessage(`Model updated to ${preset.id}`);
             setCurrentMenu("main");
             setSelectedIndex(0);
+            void applySettingsChange(
+              { model: preset.id },
+              `Failed to switch model to ${preset.id}`,
+            ).then((applied) => {
+              if (applied) setStatusMessage(`Model updated to ${preset.id}`);
+            });
           },
         };
       });
@@ -253,11 +312,14 @@ export function App({
         value: opt.desc,
         active: opt.level === activeEffort,
         action: () => {
-          setActiveEffort(opt.level);
-          onChangeEffort?.(opt.level);
-          setStatusMessage(`Effort profile set to ${opt.level}`);
           setCurrentMenu("main");
           setSelectedIndex(1);
+          void applySettingsChange(
+            { effort: opt.level },
+            `Failed to set effort profile to ${opt.level}`,
+          ).then((applied) => {
+            if (applied) setStatusMessage(`Effort profile set to ${opt.level}`);
+          });
         },
       }));
       items.push({
@@ -312,11 +374,14 @@ export function App({
             initiateLocalModelSwitch(activeModel);
             return;
           }
-          setActiveProviderType("hf");
-          onChangeProvider?.("hf");
-          setStatusMessage("Provider set to Hugging Face (Cloud)");
           setCurrentMenu("main");
           setSelectedIndex(3);
+          void applySettingsChange(
+            { provider: "hf" },
+            "Failed to switch to Hugging Face (Cloud)",
+          ).then((applied) => {
+            if (applied) setStatusMessage("Provider set to Hugging Face (Cloud)");
+          });
         },
       }));
       items.push({
@@ -800,8 +865,21 @@ export function App({
 
           {statusMessage ? (
             <Box marginBottom={1}>
-              <Text bold color="green">
-                ✓ {statusMessage}
+              <Text
+                bold
+                color={
+                  statusMessage.startsWith("✖")
+                    ? "red"
+                    : statusMessage.startsWith("⚠")
+                      ? "yellow"
+                      : "green"
+                }
+              >
+                {statusMessage.startsWith("✓") ||
+                statusMessage.startsWith("✖") ||
+                statusMessage.startsWith("⚠")
+                  ? statusMessage
+                  : `✓ ${statusMessage}`}
               </Text>
             </Box>
           ) : null}

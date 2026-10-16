@@ -16,7 +16,8 @@
   ],
   "scripts": {
     "build": "tsc -b",
-    "clean": "rm -rf dist *.tsbuildinfo"
+    "clean": "rm -rf dist *.tsbuildinfo",
+    "test": "vitest run"
   },
   "dependencies": {
     "@huggingface/transformers": "^4.3.1"
