@@ -90,10 +90,15 @@ export function formatTime(seconds: number): string {
 /**
  * Renders a standard terminal progress bar string.
  */
-export function renderProgressBar(percent: number, width = 24): string {
+export function renderProgressBar(percent: number, width = 24, frame = 0): string {
   const clamped = Math.max(0, Math.min(100, percent));
   const filled = Math.round((clamped / 100) * width);
   const empty = Math.max(0, width - filled);
+  if (frame > 0 && filled > 0 && empty > 0) {
+    const pulseChars = ["█", "▓", "▒", "░"];
+    const char = pulseChars[frame % pulseChars.length]!;
+    return `[${"█".repeat(filled - 1)}${char}${"░".repeat(empty)}]`;
+  }
   return `[${"█".repeat(filled)}${"░".repeat(empty)}]`;
 }
 

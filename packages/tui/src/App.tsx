@@ -54,6 +54,8 @@ export interface AppProps {
   onInstallModel?: (model: string, onProgress: (progress: DownloadProgress) => void, signal?: AbortSignal) => Promise<boolean>;
 }
 
+const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
 export function App({
   state,
   model,
@@ -96,6 +98,15 @@ export function App({
   const [pendingLocalModel, setPendingLocalModel] = useState<string>("");
   const [downloadProgress, setDownloadProgress] = useState<DownloadProgress | null>(null);
   const downloadAbortControllerRef = React.useRef<AbortController | null>(null);
+  const [spinnerIndex, setSpinnerIndex] = useState(0);
+
+  React.useEffect(() => {
+    if (localDialogStep !== "downloading") return;
+    const timer = setInterval(() => {
+      setSpinnerIndex((prev) => (prev + 1) % SPINNER_FRAMES.length);
+    }, 80);
+    return () => clearInterval(timer);
+  }, [localDialogStep]);
 
   // Sync props if changed externally
   React.useEffect(() => {
@@ -622,163 +633,144 @@ export function App({
         </Text>
       </Box>
 
-      {/* Confirmation Dialog Step 1: Switch to Local */}
+      {/* Step 1: Switch Confirmation */}
       {localDialogStep === "confirm" ? (
         <Box
           flexDirection="column"
-          borderStyle="double"
+          borderStyle="round"
           borderColor="cyan"
           paddingX={2}
-          paddingY={1}
+          paddingY={0}
           marginY={1}
         >
-          <Box marginBottom={1}>
+          <Box justifyContent="space-between" marginY={0}>
             <Text bold color="cyan">
               ⚡ Switch to Local Model
             </Text>
-          </Box>
-          <Box marginY={0}>
-            <Text color="white">
-              Do you want to switch to local inference for <Text bold color="yellow">{pendingLocalModel || activeModel}</Text>?
-            </Text>
-          </Box>
-          <Box marginY={0}>
             <Text color="gray">
-              Estimated file size: <Text bold color="white">{getModelEstimatedSize(pendingLocalModel || activeModel)}</Text>
-            </Text>
-          </Box>
-          <Box marginTop={1} justifyContent="space-between">
-            <Text bold color="green">
-              [y] Confirm Switch
-            </Text>
-            <Text bold color="red">
-              [n] Cancel (Stay on Cloud)
-            </Text>
-          </Box>
-        </Box>
-      ) : null}
-
-      {/* Confirmation Dialog Step 2: Model Not Installed, Ask to Install with Estimated Size */}
-      {localDialogStep === "ask_install" ? (
-        <Box
-          flexDirection="column"
-          borderStyle="double"
-          borderColor="yellow"
-          paddingX={2}
-          paddingY={1}
-          marginY={1}
-        >
-          <Box marginBottom={1}>
-            <Text bold color="yellow">
-              ⚠ Local Model Not Installed
-            </Text>
-          </Box>
-          <Box marginY={0}>
-            <Text color="white">
-              Model <Text bold color="cyan">{pendingLocalModel || activeModel}</Text> is not installed locally.
-            </Text>
-          </Box>
-          <Box marginY={0}>
-            <Text color="yellow">
-              Estimated download size: <Text bold color="white">{getModelEstimatedSize(pendingLocalModel || activeModel)}</Text>
-            </Text>
-          </Box>
-          <Box marginTop={1}>
-            <Text color="white">
-              Do you want to download and install this model locally now?
-            </Text>
-          </Box>
-          <Box marginTop={1} justifyContent="space-between">
-            <Text bold color="green">
-              [y] Install & Switch to Local
-            </Text>
-            <Text bold color="red">
-              [n] Cancel (Stay on Cloud)
-            </Text>
-          </Box>
-        </Box>
-      ) : null}
-
-      {/* Confirmation Dialog Step 3: Downloading Model Progress Bar */}
-      {localDialogStep === "downloading" ? (
-        <Box
-          flexDirection="column"
-          borderStyle="double"
-          borderColor="yellow"
-          paddingX={2}
-          paddingY={1}
-          marginY={1}
-        >
-          <Box justifyContent="space-between" marginBottom={1}>
-            <Text bold color="yellow">
-              ⬇ Downloading Local Model: {pendingLocalModel || activeModel}
-            </Text>
-            <Text bold color="red">
-              [c] Cancel download
+              {getModelEstimatedSize(pendingLocalModel || activeModel)}
             </Text>
           </Box>
           <Box marginY={0} justifyContent="space-between">
             <Text color="white">
-              Estimated size: <Text bold color="cyan">{getModelEstimatedSize(pendingLocalModel || activeModel)}</Text>
+              Target: <Text bold color="yellow">{pendingLocalModel || activeModel}</Text>
             </Text>
-            {downloadProgress ? (
-              <Text color="gray">
-                {downloadProgress.formattedDownloaded} / {downloadProgress.formattedTotal}
+            <Box>
+              <Text bold color="green">
+                [y] Confirm Switch
               </Text>
-            ) : null}
-          </Box>
-          <Box marginTop={1} flexDirection="column">
-            <Text color="cyan">
-              {renderProgressBar(downloadProgress?.percent ?? 0, 30)}{" "}
-              <Text bold color="white">
-                {downloadProgress?.percent ?? 0}%
-              </Text>
-            </Text>
-            <Box justifyContent="space-between" marginTop={1}>
-              <Text color="green">
-                ⚡ Speed: <Text bold color="white">{downloadProgress?.formattedSpeed ?? "--"}</Text>
-              </Text>
-              <Text color="magenta">
-                ⏱ ETA: <Text bold color="white">{downloadProgress?.formattedEta ?? "--"}</Text>
+              <Text color="gray">   </Text>
+              <Text bold color="red">
+                [n] Cancel (Stay on Cloud)
               </Text>
             </Box>
           </Box>
-          {downloadProgress?.statusText ? (
-            <Box marginTop={1}>
-              <Text color="gray">
-                ⚙ {downloadProgress.statusText}
-              </Text>
-            </Box>
-          ) : null}
         </Box>
       ) : null}
 
-      {/* Confirmation Dialog Step 4: Confirm Cancel Download */}
+      {/* Step 2: Model Not Installed, Ask to Install */}
+      {localDialogStep === "ask_install" ? (
+        <Box
+          flexDirection="column"
+          borderStyle="round"
+          borderColor="yellow"
+          paddingX={2}
+          paddingY={0}
+          marginY={1}
+        >
+          <Box justifyContent="space-between" marginY={0}>
+            <Text bold color="yellow">
+              ⚠ Local Model Not Installed
+            </Text>
+            <Text color="gray">
+              Estimated download size: {getModelEstimatedSize(pendingLocalModel || activeModel)}
+            </Text>
+          </Box>
+          <Box marginY={0} justifyContent="space-between">
+            <Text color="white">
+              Download <Text bold color="cyan">{pendingLocalModel || activeModel}</Text>?
+            </Text>
+            <Box>
+              <Text bold color="green">
+                [y] Install & Switch to Local
+              </Text>
+              <Text color="gray">   </Text>
+              <Text bold color="red">
+                [n] Cancel (Stay on Cloud)
+              </Text>
+            </Box>
+          </Box>
+        </Box>
+      ) : null}
+
+      {/* Step 3: Minimal Animated Download Progress */}
+      {localDialogStep === "downloading" ? (
+        <Box
+          flexDirection="column"
+          borderStyle="round"
+          borderColor="cyan"
+          paddingX={2}
+          paddingY={0}
+          marginY={1}
+        >
+          <Box justifyContent="space-between" marginY={0}>
+            <Text bold color="cyan">
+              Downloading Local Model: {pendingLocalModel || activeModel}
+            </Text>
+            <Text color="red">
+              [c] Cancel download
+            </Text>
+          </Box>
+          <Box marginY={0}>
+            <Text color="cyan">
+              {SPINNER_FRAMES[spinnerIndex]}{" "}
+            </Text>
+            <Text color="cyan">
+              {renderProgressBar(downloadProgress?.percent ?? 0, 24, spinnerIndex)}{" "}
+            </Text>
+            <Text bold color="white">
+              {downloadProgress?.percent ?? 0}%
+            </Text>
+            {downloadProgress?.formattedDownloaded && downloadProgress?.formattedTotal ? (
+              <Text color="gray">
+                {"  "}•{"  "}{downloadProgress.formattedDownloaded} / {downloadProgress.formattedTotal}
+              </Text>
+            ) : null}
+            <Text color="gray">
+              {"  "}•{"  "}
+            </Text>
+            <Text color="green">
+              {downloadProgress?.formattedSpeed ?? "--"}
+            </Text>
+            <Text color="gray">
+              {"  "}•{"  "}
+            </Text>
+            <Text color="magenta">
+              {downloadProgress?.formattedEta ?? "--"}
+            </Text>
+          </Box>
+        </Box>
+      ) : null}
+
+      {/* Step 4: Minimal Cancel Confirmation */}
       {localDialogStep === "confirm_cancel" ? (
         <Box
           flexDirection="column"
-          borderStyle="double"
+          borderStyle="round"
           borderColor="red"
           paddingX={2}
-          paddingY={1}
+          paddingY={0}
           marginY={1}
         >
-          <Box marginBottom={1}>
+          <Box justifyContent="space-between" marginY={0}>
             <Text bold color="red">
               ⚠ Cancel Model Download?
             </Text>
-          </Box>
-          <Box marginY={0}>
-            <Text color="white">
-              A download is currently in progress ({downloadProgress?.percent ?? 0}% complete).
-            </Text>
-          </Box>
-          <Box marginY={0}>
             <Text color="gray">
-              If you cancel now, downloaded temporary files will be cleaned up and the provider will remain on Cloud.
+              {downloadProgress?.percent ?? 0}% complete
             </Text>
           </Box>
-          <Box marginTop={1} justifyContent="space-between">
+          <Box marginY={0} justifyContent="space-between">
             <Text bold color="red">
               [y] Yes, cancel download
             </Text>
@@ -934,19 +926,19 @@ export function App({
       <Box borderStyle="single" borderColor={localDialogStep !== "none" ? "cyan" : isSettingsOpen ? "magenta" : busy ? "yellow" : "green"} paddingX={1}>
         {localDialogStep === "confirm" ? (
           <Text color="cyan">
-            ⚡ Switch to Local: press [y] to confirm switch, [n] to cancel
+            [y] Confirm switch   [n] Cancel
           </Text>
         ) : localDialogStep === "ask_install" ? (
           <Text color="yellow">
-            ⚠ Install Local Model: press [y] to install with estimate size, [n] to cancel
+            [y] Download model   [n] Cancel
           </Text>
         ) : localDialogStep === "downloading" ? (
-          <Text color="yellow">
-            ⬇ Downloading local model… [c] Cancel download
+          <Text color="cyan">
+            {SPINNER_FRAMES[spinnerIndex]} Downloading… [c] Cancel
           </Text>
         ) : localDialogStep === "confirm_cancel" ? (
           <Text color="red">
-            ⚠ Confirm Cancel: [y] Yes, cancel download   [n] Continue downloading
+            Cancel download? [y] Yes   [n] No
           </Text>
         ) : isSettingsOpen ? (
           <Text color="magenta">
