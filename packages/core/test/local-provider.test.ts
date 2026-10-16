@@ -30,7 +30,12 @@ describe("LocalProvider", () => {
   });
 
   it("fails gracefully with helpful message when @huggingface/transformers is missing", async () => {
-    const provider = new LocalProvider({ modelId: "google/gemma-2-2b-it" });
+    const provider = new LocalProvider({
+      modelId: "google/gemma-2-2b-it",
+      loadTransformers: async () => {
+        throw new Error("Cannot find package '@huggingface/transformers'");
+      }
+    });
     await expect(async () => {
       for await (const _ of provider.streamChat([{ role: "user", content: "hi" }], [])) {
         // stream

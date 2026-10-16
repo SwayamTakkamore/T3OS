@@ -35,15 +35,30 @@ type TextGenerator = (
   }
 ) => Promise<unknown>;
 
-interface TransformersModule {
+export interface TransformersModule {
   pipeline(task: string, modelId: string): Promise<TextGenerator>;
 }
 
-async function transformersGenerate(modelId: string): Promise<GenerateFn> {
+export type TransformersLoader = () => Promise<TransformersModule>;
+
+/**
+ * Default loader. The specifier is a variable so that Node resolves
+ * `@huggingface/transformers` at runtime using ESM module resolution relative
+ * to this package (from `dist/provider/local.js` up to
+ * `packages/core/node_modules`), rather than bundling it at build time.
+ */
+async function defaultTransformersLoader(): Promise<TransformersModule> {
   const specifier = "@huggingface/transformers";
+  return (await import(specifier)) as unknown as TransformersModule;
+}
+
+async function transformersGenerate(
+  modelId: string,
+  loadTransformers: TransformersLoader
+): Promise<GenerateFn> {
   let mod: TransformersModule;
   try {
-    mod = (await import(specifier)) as unknown as TransformersModule;
+    mod = await loadTransformers();
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     throw new Error(
@@ -85,6 +100,8 @@ export interface LocalProviderOptions {
   modelId: string;
   generate?: GenerateFn;
   contextLength?: number;
+  /** Overrides how `@huggingface/transformers` is loaded; mainly for testing. */
+  loadTransformers?: TransformersLoader;
 }
 
 export class LocalProvider implements Provider {
@@ -92,6 +109,7 @@ export class LocalProvider implements Provider {
   readonly #modelId: string;
   readonly #preset: ModelPreset;
   readonly #contextLength: number;
+  readonly #loadTransformers: TransformersLoader;
   #generate: GenerateFn | undefined;
 
   constructor(options: LocalProviderOptions) {
@@ -99,6 +117,7 @@ export class LocalProvider implements Provider {
     this.#preset = resolvePreset(options.modelId);
     this.#contextLength = options.contextLength ?? this.#preset.contextLength;
     this.#generate = options.generate;
+    this.#loadTransformers = options.loadTransformers ?? defaultTransformersLoader;
   }
 
   capabilities(): ProviderCapabilities {
@@ -108,7 +127,7 @@ export class LocalProvider implements Provider {
   async #load(): Promise<GenerateFn> {
     const existing = this.#generate;
     if (existing) return existing;
-    const built = await transformersGenerate(this.#modelId);
+    const built = await transformersGenerate(this.#modelId, this.#loadTransformers);
     this.#generate = built;
     return built;
   }
