@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
-import { appendFile, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { T3osError } from "../errors.js";
 import type { AgentEvent, PermissionMode } from "../types.js";
 import type { EffortLevel } from "../presets/index.js";
 import { sessionsDir } from "./paths.js";
@@ -140,6 +141,18 @@ export class SessionStore {
 
   async replay(id: string): Promise<AgentEvent[]> {
     return (await this.#readAll(id)).events;
+  }
+
+  /** Deletes a session file. Throws when the session does not exist. */
+  async delete(id: string): Promise<void> {
+    try {
+      await rm(this.#path(id));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
+        throw new T3osError("config", `Session not found: ${id}`);
+      }
+      throw error;
+    }
   }
 
   async resume(id: string): Promise<AgentEvent[]> {

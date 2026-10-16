@@ -21,8 +21,11 @@ import type { TurnRunner } from "./app.js";
 
 async function makeProvider(model: string, kind: "hf" | "local", effort?: any): Promise<Provider> {
   const preset = resolvePreset(model, effort);
-  if (kind === "local") return new LocalProvider({ modelId: preset.id });
+  // The token is resolved for both provider kinds: gated models (e.g. Gemma)
+  // require an authenticated request even for local inference.
   const token = await new SecretResolver({ env: process.env }).resolve(new SecretRef("HF_TOKEN"));
+  if (token) process.env.HF_TOKEN = token;
+  if (kind === "local") return new LocalProvider({ modelId: preset.id, token });
   if (!token) {
     const opened = openBrowser(HF_TOKEN_URL);
     console.error("HF_TOKEN is not set.");

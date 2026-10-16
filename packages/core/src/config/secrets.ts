@@ -81,7 +81,7 @@ export class SecretRef {
 
 export interface SecretResolverOptions {
   env: NodeJS.ProcessEnv;
-  keyring?: Keyring;
+  keyring?: Keyring | undefined;
 }
 
 export class SecretResolver {

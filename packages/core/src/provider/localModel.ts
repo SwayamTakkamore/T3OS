@@ -127,6 +127,12 @@ export interface InstallModelOptions {
   onProgress?: (progress: DownloadProgress) => void;
   cacheDir?: string;
   signal?: AbortSignal;
+  /**
+   * Hugging Face access token. Gated models (e.g. Gemma) require an
+   * authenticated download; when provided it is mirrored onto
+   * `process.env.HF_TOKEN` for the Hub client.
+   */
+  token?: string | undefined;
 }
 
 export interface LocalModelInstallResult {
@@ -209,6 +215,11 @@ export async function installLocalModel(
   const estimatedSize = getModelEstimatedSize(normalized);
   const totalBytes = getModelTotalBytes(normalized);
   const sanitized = normalized.replace(/\//g, "--");
+
+  if (options?.token) {
+    // Gated models require an authenticated request to the Hugging Face Hub.
+    process.env.HF_TOKEN = options.token;
+  }
 
   const hubDir = options?.cacheDir ?? join(homedir(), ".cache", "huggingface", "hub");
   const targetDir = join(hubDir, `models--${sanitized}`);

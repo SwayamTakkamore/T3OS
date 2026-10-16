@@ -75,6 +75,8 @@ export interface AppProps {
   onNewSession?: () => SessionActionResult;
   /** Switch to (resume) an existing session by id. */
   onSwitchSession?: (id: string) => SessionActionResult;
+  /** Delete a session by id (from the Switch/Resume list). */
+  onDeleteSession?: (id: string) => SessionActionResult;
   /** Back up the active session; may resolve to a status message. */
   onBackupSession?: () => SessionActionResult;
   /** Restore a session from a backup path. */
@@ -127,6 +129,7 @@ export function App({
   backups,
   onNewSession,
   onSwitchSession,
+  onDeleteSession,
   onBackupSession,
   onRestoreBackup,
 }: AppProps): React.ReactElement {
@@ -772,6 +775,24 @@ export function App({
         return;
       }
 
+      // "d" deletes the highlighted session from the Switch/Resume list.
+      if (currentMenu === "sessions-switch" && (value === "d" || value === "D")) {
+        const target = sessions?.[selectedIndex];
+        if (target) {
+          const remaining = (sessions?.length ?? 0) - 1;
+          if (remaining > 0) {
+            setSelectedIndex((prev) => Math.min(prev, remaining - 1));
+          } else {
+            setCurrentMenu("sessions");
+            setSelectedIndex(0);
+          }
+          runSessionAction(`Deleted session ${target.id}`, () =>
+            onDeleteSession?.(target.id),
+          );
+        }
+        return;
+      }
+
       if (key.backspace || key.delete) {
         if (currentMenu !== "main") {
           setCurrentMenu("main");
@@ -1087,6 +1108,11 @@ export function App({
                   {item.value ? (
                     <Text color={isSelected ? "yellow" : "gray"}>
                       {item.value}
+                      {currentMenu === "sessions-switch" &&
+                      isSelected &&
+                      idx < (sessions?.length ?? 0)
+                        ? "   [d] Delete"
+                        : ""}
                     </Text>
                   ) : null}
                 </Box>
@@ -1102,7 +1128,9 @@ export function App({
             justifyContent="space-between"
           >
             <Text dimColor>
-              [↑/↓] Navigate   [Enter] Select
+              {currentMenu === "sessions-switch"
+                ? "[↑/↓] Navigate   [Enter] Select   [d] Delete"
+                : "[↑/↓] Navigate   [Enter] Select"}
             </Text>
             <Text dimColor>
               [Esc / Backspace] Back

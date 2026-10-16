@@ -227,6 +227,24 @@ export async function startRepl(options: ReplOptions): Promise<void> {
     return `✓ Backed up session to ${result.backupPath}`;
   }
 
+  /**
+   * Deletes a session. When the active session is deleted we fall back to the
+   * most recent remaining session, or start a new one when none are left.
+   */
+  async function deleteSession(id: string): Promise<string> {
+    await options.store.delete(id);
+    if (id === sessionId) {
+      const remaining = await options.store.list().catch((): SessionMeta[] => []);
+      if (remaining.length > 0) {
+        await switchSession(remaining[0]!.id);
+      } else {
+        return await newSession();
+      }
+    }
+    await refreshSessions();
+    return `Deleted session ${id}`;
+  }
+
   /** Restores a backup into a new session and switches to it. */
   async function restoreBackup(backupPath: string): Promise<string> {
     const restored = await options.store.restoreBackup(backupPath);
@@ -278,6 +296,7 @@ export async function startRepl(options: ReplOptions): Promise<void> {
       },
       onNewSession: () => newSession(),
       onSwitchSession: (id: string) => switchSession(id),
+      onDeleteSession: (id: string) => deleteSession(id),
       onBackupSession: () => backupSession(),
       onRestoreBackup: (path: string) => restoreBackup(path),
       ...(options.onOpenToken ? { onOpenToken: options.onOpenToken } : {}),

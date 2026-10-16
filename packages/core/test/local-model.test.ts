@@ -74,6 +74,25 @@ describe("localModel", () => {
     }
   });
 
+  it("uses the provided HF token for authenticated Hugging Face requests", async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), "t3os-test-hf-"));
+    const previous = process.env.HF_TOKEN;
+    delete process.env.HF_TOKEN;
+    try {
+      const result = await installLocalModel("google/gemma-3-4b-it", {
+        cacheDir: tempDir,
+        token: "hf_install_token_test",
+      });
+
+      expect(result.success).toBe(true);
+      expect(process.env.HF_TOKEN).toBe("hf_install_token_test");
+    } finally {
+      if (previous === undefined) delete process.env.HF_TOKEN;
+      else process.env.HF_TOKEN = previous;
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
   it("supports cancelling the download in progress", async () => {
     const tempDir = await mkdtemp(join(tmpdir(), "t3os-test-hf-"));
     const controller = new AbortController();

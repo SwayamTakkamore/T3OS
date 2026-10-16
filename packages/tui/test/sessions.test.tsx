@@ -263,6 +263,43 @@ describe("App sessions menu", () => {
     await tick(120);
     expect(onRestoreBackup).toHaveBeenCalledWith("/tmp/backups/a.jsonl");
   });
+
+  it("deletes the highlighted session with the d key", async () => {
+    const onDeleteSession = vi.fn().mockResolvedValue(undefined);
+    const { stdin, lastFrame } = render(
+      <App
+        state={emptyTranscript()}
+        model="google/gemma-3-27b-it"
+        sessionId="sess-2"
+        sessions={sessions}
+        onSubmit={() => {}}
+        onPermission={() => {}}
+        onDeleteSession={onDeleteSession}
+      />,
+    );
+    await tick(100);
+    await openSessionsMenu(stdin);
+
+    // Drill into "Switch / Resume Session" (index 2).
+    stdin.write(DOWN);
+    await tick(30);
+    stdin.write(DOWN);
+    await tick(30);
+    stdin.write(ENTER);
+    await tick(80);
+
+    // The selected row advertises the delete affordance.
+    let frame = lastFrame();
+    expect(frame).toContain("[d] Delete");
+
+    // "d" deletes the highlighted session (sess-1).
+    stdin.write("d");
+    await tick(120);
+
+    expect(onDeleteSession).toHaveBeenCalledWith("sess-1");
+    frame = lastFrame();
+    expect(frame).toContain("Deleted session sess-1");
+  });
 });
 
 describe("App session restore", () => {

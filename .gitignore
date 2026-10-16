@@ -7,5 +7,5 @@ build/
 .env.*
 coverage/
 *.tsbuildinfo
-.t3os/local/
+.t3os/
 .opencode/

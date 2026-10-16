@@ -109,6 +109,23 @@ describe("SessionStore", () => {
     expect(f.settings).toEqual({ model: "m1", provider: "hf" });
     expect((await store.getMeta(f.id))?.settings).toEqual({ model: "m1", provider: "hf" });
   });
+
+  it("deletes a session so it no longer lists or replays", async () => {
+    const doomed = await store.create("doomed");
+    const kept = await store.create("kept");
+    await store.append(doomed.id, text("bye"));
+
+    await store.delete(doomed.id);
+
+    expect((await store.list()).map((m) => m.id)).not.toContain(doomed.id);
+    expect((await store.list()).map((m) => m.id)).toContain(kept.id);
+    expect(await store.getMeta(doomed.id)).toBeNull();
+    await expect(store.replay(doomed.id)).rejects.toThrow();
+  });
+
+  it("rejects deleting an unknown session", async () => {
+    await expect(store.delete("missing")).rejects.toThrow(/not found/i);
+  });
 });
 
 describe("SessionStore backups", () => {

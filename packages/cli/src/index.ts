@@ -121,10 +121,12 @@ async function defaultProvider(
   deps: CliDeps
 ): Promise<Provider> {
   const preset = resolvePreset(config.model, config.effort);
-  if (config.provider === "local") {
-    return new LocalProvider({ modelId: preset.id });
-  }
+  // The token is resolved for both provider kinds: gated models (e.g. Gemma)
+  // require an authenticated request even for local inference.
   const token = await resolveToken(deps);
+  if (config.provider === "local") {
+    return new LocalProvider({ modelId: preset.id, token });
+  }
   if (!token) {
     throw new T3osError(
       "config",

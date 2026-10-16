@@ -3,10 +3,6 @@ import { homedir } from "node:os";
 import {
   ConfigLoader,
   HF_TOKEN_URL,
-  HuggingFaceProvider,
-  LocalProvider,
-  SecretRef,
-  SecretResolver,
   SessionStore,
   T3osError,
   createPolicy,
@@ -18,6 +14,7 @@ import {
   type Provider,
 } from "@t3os/core";
 import { startRepl } from "./repl.js";
+import { makeProvider } from "./providerFactory.js";
 
 // Parse CLI flags (e.g. node bin.js --model gemma-4 --effort max --session <id>)
 const argv = process.argv.slice(2);
@@ -54,31 +51,6 @@ const config = await new ConfigLoader({
   env: process.env,
   flags: flagsForConfig,
 }).resolve();
-
-async function makeProvider(
-  modelId: string = config.model,
-  effort: EffortLevel = config.effort,
-  providerType: "hf" | "local" = config.provider
-): Promise<Provider> {
-  const resolved = resolvePreset(modelId, effort);
-  if (providerType === "local") {
-    return new LocalProvider({ modelId: resolved.id });
-  }
-  const token = await new SecretResolver({ env: process.env }).resolve(
-    new SecretRef("HF_TOKEN")
-  );
-  if (!token) {
-    throw new T3osError(
-      "config",
-      "HF_TOKEN is not set; run `t3os auth login` or `t3os auth set <token>`"
-    );
-  }
-  return new HuggingFaceProvider({
-    model: resolved.id,
-    token,
-    contextLength: resolved.contextLength,
-  });
-}
 
 const store = new SessionStore(config.sessionDir);
 
