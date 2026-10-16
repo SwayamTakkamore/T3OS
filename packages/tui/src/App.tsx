@@ -5,7 +5,9 @@ import {
   checkLocalModelInstalled,
   getModelEstimatedSize,
   installLocalModel,
+  renderProgressBar,
   type ApprovalOutcome,
+  type DownloadProgress,
   type EffortLevel,
   type PermissionMode,
   type PermissionRequest,
@@ -49,7 +51,7 @@ export interface AppProps {
   onChangePermissionMode?: (mode: PermissionMode) => void;
   onChangeProvider?: (provider: "hf" | "local") => void;
   onCheckModelInstalled?: (model: string) => Promise<boolean>;
-  onInstallModel?: (model: string, onProgress: (msg: string) => void) => Promise<boolean>;
+  onInstallModel?: (model: string, onProgress: (progress: DownloadProgress) => void, signal?: AbortSignal) => Promise<boolean>;
 }
 
 export function App({
@@ -88,9 +90,12 @@ export function App({
   const [activeProviderType, setActiveProviderType] = useState<"hf" | "local">(providerType);
 
   // Local Model Switch & Install Dialog state
-  const [localDialogStep, setLocalDialogStep] = useState<"none" | "confirm" | "ask_install" | "installing">("none");
+  const [localDialogStep, setLocalDialogStep] = useState<
+    "none" | "confirm" | "ask_install" | "downloading" | "confirm_cancel"
+  >("none");
   const [pendingLocalModel, setPendingLocalModel] = useState<string>("");
-  const [installProgressMsg, setInstallProgressMsg] = useState<string>("");
+  const [downloadProgress, setDownloadProgress] = useState<DownloadProgress | null>(null);
+  const downloadAbortControllerRef = React.useRef<AbortController | null>(null);
 
   // Sync props if changed externally
   React.useEffect(() => {
@@ -134,38 +139,60 @@ export function App({
 
   const handleConfirmInstall = async () => {
     const target = pendingLocalModel || activeModel;
-    setLocalDialogStep("installing");
-    setInstallProgressMsg("Preparing local model environment and cache…");
+    setLocalDialogStep("downloading");
+    setDownloadProgress(null);
+
+    const controller = new AbortController();
+    downloadAbortControllerRef.current = controller;
 
     try {
       let success = false;
       if (onInstallModel) {
-        success = await onInstallModel(target, (msg) => setInstallProgressMsg(msg));
+        success = await onInstallModel(
+          target,
+          (prog) => setDownloadProgress(prog),
+          controller.signal,
+        );
       } else {
         const result = await installLocalModel(target, {
-          onProgress: (msg) => setInstallProgressMsg(msg),
+          onProgress: (prog) => setDownloadProgress(prog),
+          signal: controller.signal,
         });
         success = result.success;
-        if (!success && result.error) {
+        if (!success && result.error && !controller.signal.aborted) {
           throw new Error(result.error);
         }
       }
 
+      if (controller.signal.aborted) {
+        setLocalDialogStep("none");
+        setStatusMessage("✖ Download cancelled. Remaining on Cloud.");
+        return;
+      }
+
       if (success) {
+        const verification = await checkLocalModelInstalled(target);
+        const resolvedPath = verification.path || "configured";
         setActiveProviderType("local");
         setActiveModel(target);
         onChangeModel?.(target);
         onChangeProvider?.("local");
         setLocalDialogStep("none");
-        setStatusMessage(`✓ Model ${target} installed successfully. Switched to local mode.`);
+        setStatusMessage(`✓ Model ${target} downloaded and path set (${resolvedPath}). Switched to local mode.`);
       } else {
         setLocalDialogStep("none");
         setStatusMessage(`✖ Installation of ${target} failed.`);
       }
     } catch (err) {
       setLocalDialogStep("none");
-      const errorMsg = err instanceof Error ? err.message : String(err);
-      setStatusMessage(`✖ Installation failed: ${errorMsg}`);
+      if (controller.signal.aborted) {
+        setStatusMessage("✖ Download cancelled. Remaining on Cloud.");
+      } else {
+        const errorMsg = err instanceof Error ? err.message : String(err);
+        setStatusMessage(`✖ Installation failed: ${errorMsg}`);
+      }
+    } finally {
+      downloadAbortControllerRef.current = null;
     }
   };
 
@@ -397,10 +424,28 @@ export function App({
       return;
     }
 
-    // Handle Local Model Dialog Prompts (Confirmation -> Not Installed Check -> Install Prompt -> Installing)
+    // Handle Local Model Dialog Prompts (Confirmation -> Not Installed Check -> Install Prompt -> Downloading -> Confirm Cancel)
     if (localDialogStep !== "none") {
-      if (localDialogStep === "installing") {
-        return; // Ignore inputs during active installation
+      if (localDialogStep === "downloading") {
+        if (value === "c" || key.escape) {
+          setLocalDialogStep("confirm_cancel");
+        }
+        return;
+      }
+
+      if (localDialogStep === "confirm_cancel") {
+        if (value === "y" || key.return) {
+          downloadAbortControllerRef.current?.abort();
+          setLocalDialogStep("none");
+          setPendingLocalModel("");
+          setStatusMessage("✖ Download cancelled. Remaining on Cloud.");
+          return;
+        }
+        if (value === "n" || key.escape) {
+          setLocalDialogStep("downloading");
+          return;
+        }
+        return;
       }
 
       if (localDialogStep === "confirm") {
@@ -654,8 +699,8 @@ export function App({
         </Box>
       ) : null}
 
-      {/* Confirmation Dialog Step 3: Installing Model Progress */}
-      {localDialogStep === "installing" ? (
+      {/* Confirmation Dialog Step 3: Downloading Model Progress Bar */}
+      {localDialogStep === "downloading" ? (
         <Box
           flexDirection="column"
           borderStyle="double"
@@ -664,23 +709,82 @@ export function App({
           paddingY={1}
           marginY={1}
         >
-          <Box marginBottom={1}>
+          <Box justifyContent="space-between" marginBottom={1}>
             <Text bold color="yellow">
-              ⬇ Installing Local Model: {pendingLocalModel || activeModel}
+              ⬇ Downloading Local Model: {pendingLocalModel || activeModel}
+            </Text>
+            <Text bold color="red">
+              [c] Cancel download
+            </Text>
+          </Box>
+          <Box marginY={0} justifyContent="space-between">
+            <Text color="white">
+              Estimated size: <Text bold color="cyan">{getModelEstimatedSize(pendingLocalModel || activeModel)}</Text>
+            </Text>
+            {downloadProgress ? (
+              <Text color="gray">
+                {downloadProgress.formattedDownloaded} / {downloadProgress.formattedTotal}
+              </Text>
+            ) : null}
+          </Box>
+          <Box marginTop={1} flexDirection="column">
+            <Text color="cyan">
+              {renderProgressBar(downloadProgress?.percent ?? 0, 30)}{" "}
+              <Text bold color="white">
+                {downloadProgress?.percent ?? 0}%
+              </Text>
+            </Text>
+            <Box justifyContent="space-between" marginTop={1}>
+              <Text color="green">
+                ⚡ Speed: <Text bold color="white">{downloadProgress?.formattedSpeed ?? "--"}</Text>
+              </Text>
+              <Text color="magenta">
+                ⏱ ETA: <Text bold color="white">{downloadProgress?.formattedEta ?? "--"}</Text>
+              </Text>
+            </Box>
+          </Box>
+          {downloadProgress?.statusText ? (
+            <Box marginTop={1}>
+              <Text color="gray">
+                ⚙ {downloadProgress.statusText}
+              </Text>
+            </Box>
+          ) : null}
+        </Box>
+      ) : null}
+
+      {/* Confirmation Dialog Step 4: Confirm Cancel Download */}
+      {localDialogStep === "confirm_cancel" ? (
+        <Box
+          flexDirection="column"
+          borderStyle="double"
+          borderColor="red"
+          paddingX={2}
+          paddingY={1}
+          marginY={1}
+        >
+          <Box marginBottom={1}>
+            <Text bold color="red">
+              ⚠ Cancel Model Download?
             </Text>
           </Box>
           <Box marginY={0}>
             <Text color="white">
-              Estimated size: <Text bold color="cyan">{getModelEstimatedSize(pendingLocalModel || activeModel)}</Text>
+              A download is currently in progress ({downloadProgress?.percent ?? 0}% complete).
             </Text>
           </Box>
-          <Box marginTop={1}>
-            <Text color="green">
-              ⚙ {installProgressMsg || "Downloading and setting up model artifacts…"}
+          <Box marginY={0}>
+            <Text color="gray">
+              If you cancel now, downloaded temporary files will be cleaned up and the provider will remain on Cloud.
             </Text>
           </Box>
-          <Box marginTop={1}>
-            <Text dimColor>Please wait, installation is in progress…</Text>
+          <Box marginTop={1} justifyContent="space-between">
+            <Text bold color="red">
+              [y] Yes, cancel download
+            </Text>
+            <Text bold color="green">
+              [n] Continue downloading
+            </Text>
           </Box>
         </Box>
       ) : null}
@@ -836,9 +940,13 @@ export function App({
           <Text color="yellow">
             ⚠ Install Local Model: press [y] to install with estimate size, [n] to cancel
           </Text>
-        ) : localDialogStep === "installing" ? (
+        ) : localDialogStep === "downloading" ? (
           <Text color="yellow">
-            ⬇ Installing local model… please wait
+            ⬇ Downloading local model… [c] Cancel download
+          </Text>
+        ) : localDialogStep === "confirm_cancel" ? (
+          <Text color="red">
+            ⚠ Confirm Cancel: [y] Yes, cancel download   [n] Continue downloading
           </Text>
         ) : isSettingsOpen ? (
           <Text color="magenta">
