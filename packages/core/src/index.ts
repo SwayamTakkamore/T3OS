@@ -5,6 +5,7 @@ export * from "./sessions/store.js";
 export * from "./sessions/paths.js";
 export * from "./config/types.js";
 export * from "./config/loader.js";
+export * from "./config/lastSettings.js";
 export * from "./config/secrets.js";
 export * from "./provider/types.js";
 export * from "./provider/sse.js";

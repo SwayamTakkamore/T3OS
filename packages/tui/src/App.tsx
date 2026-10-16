@@ -11,6 +11,8 @@ import {
   type EffortLevel,
   type PermissionMode,
   type PermissionRequest,
+  type SessionBackup,
+  type SessionMeta,
 } from "@t3os/core";
 import type { SettingsUpdate } from "./settings.js";
 import type { TranscriptState } from "./transcript.js";
@@ -26,7 +28,10 @@ export type SettingsMenuType =
   | "effort"
   | "permission"
   | "provider"
-  | "auth";
+  | "auth"
+  | "sessions"
+  | "sessions-switch"
+  | "sessions-restore";
 
 export interface MenuItem {
   label: string;
@@ -60,9 +65,43 @@ export interface AppProps {
   onChangeProvider?: (provider: "hf" | "local") => void | Promise<void>;
   onCheckModelInstalled?: (model: string) => Promise<boolean>;
   onInstallModel?: (model: string, onProgress: (progress: DownloadProgress) => void, signal?: AbortSignal) => Promise<boolean>;
+  /** Active session id, surfaced in the header and the Sessions menu. */
+  sessionId?: string;
+  /** Available sessions (newest first) for the Switch/Resume submenu. */
+  sessions?: SessionMeta[];
+  /** Available backups for the Restore submenu. */
+  backups?: SessionBackup[];
+  /** Start a brand-new session and switch to it. */
+  onNewSession?: () => SessionActionResult;
+  /** Switch to (resume) an existing session by id. */
+  onSwitchSession?: (id: string) => SessionActionResult;
+  /** Back up the active session; may resolve to a status message. */
+  onBackupSession?: () => SessionActionResult;
+  /** Restore a session from a backup path. */
+  onRestoreBackup?: (backupPath: string) => SessionActionResult;
 }
 
+/** A session callback may resolve to a status string shown in the palette. */
+export type SessionActionResult = void | string | Promise<void | string>;
+
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/** Human-friendly timestamp for session/backup lists. */
+function formatSessionTime(iso: string): string {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return iso;
+  return date.toISOString().replace("T", " ").slice(0, 16);
+}
+
+function providerLabel(provider?: "hf" | "local"): string {
+  return provider === "local" ? "Local" : "Cloud";
+}
+
+function shortModel(model?: string): string {
+  if (!model) return "?";
+  const parts = model.split("/");
+  return parts[parts.length - 1] ?? model;
+}
 
 export function App({
   state,
@@ -83,6 +122,13 @@ export function App({
   onChangeSettings,
   onCheckModelInstalled,
   onInstallModel,
+  sessionId,
+  sessions,
+  backups,
+  onNewSession,
+  onSwitchSession,
+  onBackupSession,
+  onRestoreBackup,
 }: AppProps): React.ReactElement {
   const [input, setInput] = useState("");
   const [history, setHistory] = useState<string[]>([]);
@@ -264,6 +310,26 @@ export function App({
   };
 
   // Build menu items based on current menu
+  /**
+   * Runs an async session action (new/switch/backup/restore) and surfaces its
+   * result (or failure) as a palette status message.
+   */
+  const runSessionAction = (
+    fallbackMessage: string,
+    action?: () => SessionActionResult,
+  ): void => {
+    if (!action) return;
+    void (async () => {
+      try {
+        const result = await action();
+        setStatusMessage(typeof result === "string" ? result : fallbackMessage);
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        setStatusMessage(`✖ Session action failed: ${detail}`);
+      }
+    })();
+  };
+
   const getMenuItems = (): MenuItem[] => {
     if (currentMenu === "model") {
       const items: MenuItem[] = GEMMA_PRESETS.map((preset) => {
@@ -414,6 +480,108 @@ export function App({
       ];
     }
 
+    if (currentMenu === "sessions") {
+      return [
+        {
+          label: "Current Session",
+          value: sessionId ?? "(none)",
+          action: () => {
+            setStatusMessage(
+              sessionId ? `Active session: ${sessionId}` : "No active session",
+            );
+          },
+        },
+        {
+          label: "New Session",
+          value: "fresh transcript",
+          action: () => {
+            runSessionAction("Started a new session", onNewSession);
+          },
+        },
+        {
+          label: "Switch / Resume Session",
+          value: `${sessions?.length ?? 0} available`,
+          action: () => {
+            setCurrentMenu("sessions-switch");
+            setSelectedIndex(0);
+          },
+        },
+        {
+          label: "Backup Current Session",
+          value: "export",
+          action: () => {
+            runSessionAction("Session backed up", onBackupSession);
+          },
+        },
+        {
+          label: "Restore Session Backup",
+          value: `${backups?.length ?? 0} available`,
+          action: () => {
+            if (!backups || backups.length === 0) {
+              setStatusMessage("⚠ No session backups found");
+              return;
+            }
+            setCurrentMenu("sessions-restore");
+            setSelectedIndex(0);
+          },
+        },
+        {
+          label: "← Back to Main Menu",
+          action: () => {
+            setCurrentMenu("main");
+            setSelectedIndex(5);
+          },
+        },
+      ];
+    }
+
+    if (currentMenu === "sessions-switch") {
+      const items: MenuItem[] = (sessions ?? []).map((session) => ({
+        label: session.title,
+        value: `${shortModel(session.settings?.model)} · ${providerLabel(session.settings?.provider)} · ${formatSessionTime(session.updatedAt)}`,
+        active: session.id === sessionId,
+        action: () => {
+          setCurrentMenu("main");
+          setSelectedIndex(5);
+          runSessionAction(
+            `Resumed session ${session.id}`,
+            () => onSwitchSession?.(session.id),
+          );
+        },
+      }));
+      items.push({
+        label: "← Back to Sessions",
+        action: () => {
+          setCurrentMenu("sessions");
+          setSelectedIndex(0);
+        },
+      });
+      return items;
+    }
+
+    if (currentMenu === "sessions-restore") {
+      const items: MenuItem[] = (backups ?? []).map((backup) => ({
+        label: backup.id,
+        value: formatSessionTime(backup.createdAt),
+        action: () => {
+          setCurrentMenu("main");
+          setSelectedIndex(5);
+          runSessionAction(
+            `Restored backup ${backup.id}`,
+            () => onRestoreBackup?.(backup.backupPath),
+          );
+        },
+      }));
+      items.push({
+        label: "← Back to Sessions",
+        action: () => {
+          setCurrentMenu("sessions");
+          setSelectedIndex(4);
+        },
+      });
+      return items;
+    }
+
     // Default: Main Menu
     return [
       {
@@ -457,6 +625,14 @@ export function App({
         },
       },
       {
+        label: "Sessions",
+        value: sessionId ? sessionId.slice(0, 19) : "new",
+        action: () => {
+          setCurrentMenu("sessions");
+          setSelectedIndex(0);
+        },
+      },
+      {
         label: "Clear Transcript",
         value: "Ctrl+L",
         action: () => {
@@ -488,6 +664,12 @@ export function App({
         return "AI Provider";
       case "auth":
         return "Hugging Face Authentication";
+      case "sessions":
+        return "Sessions";
+      case "sessions-switch":
+        return "Switch / Resume Session";
+      case "sessions-restore":
+        return "Restore Session Backup";
       default:
         return "Main Menu";
     }
@@ -689,9 +871,14 @@ export function App({
         paddingX={1}
         justifyContent="space-between"
       >
-        <Text bold color="cyan">
-          T3OS Agent
-        </Text>
+        <Box flexDirection="column">
+          <Text bold color="cyan">
+            T3OS Agent
+          </Text>
+          <Text color="gray">
+            Session: {sessionId ?? "(new)"}
+          </Text>
+        </Box>
         <Text color="gray">
           Provider: <Text bold color={activeProviderType === "local" ? "green" : "magenta"}>[{activeProviderType === "local" ? "LOCAL" : "CLOUD"}]</Text>{" "}
           Model: <Text bold color="white">{activeModel}</Text> ({activeEffort})

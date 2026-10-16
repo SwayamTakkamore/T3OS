@@ -4,12 +4,16 @@ import {
   builtInTools,
   createPolicy,
   runTurn,
+  saveLastSettings,
+  type AgentEvent,
   type ApprovalOutcome,
   type EffortLevel,
   type PermissionMode,
   type PermissionPolicy,
   type PermissionRequest,
   type Provider,
+  type SessionBackup,
+  type SessionMeta,
   type SessionStore,
   type TurnEndReason,
 } from "@t3os/core";
@@ -84,14 +88,45 @@ export function createReplSettings(options: ReplSettingsOptions): SettingsContro
   });
 }
 
+/** Folds a persisted event stream back into a rendered transcript state. */
+export function transcriptFromEvents(events: AgentEvent[]): TranscriptState {
+  return events.reduce(
+    (acc, event) => reduceTranscript(acc, event),
+    emptyTranscript()
+  );
+}
+
 export async function startRepl(options: ReplOptions): Promise<void> {
   let state: TranscriptState = emptyTranscript();
   let busy = false;
   let pending: PendingPermission | null = null;
   let resolvePermission: ((outcome: ApprovalOutcome) => void) | null = null;
 
+  // The active session can change while the REPL runs (switch / new / restore).
+  let sessionId = options.sessionId;
+  let sessions: SessionMeta[] = [];
+  let backups: SessionBackup[] = [];
+
   let currentPolicy = options.policy;
   let currentPermissionMode = options.permissionMode ?? "ask";
+
+  /**
+   * Persists the committed settings both to the active session header (so
+   * resuming restores them) and to the project config (so the last chosen
+   * model/effort/provider/permission mode survive restarts).
+   */
+  async function persistSettings(snapshot: SettingsSnapshot): Promise<void> {
+    const projectSettings = {
+      model: snapshot.model,
+      effort: snapshot.effort,
+      provider: snapshot.providerType,
+      permissionMode: currentPermissionMode,
+    };
+    await Promise.allSettled([
+      options.store.updateSettings(sessionId, projectSettings),
+      saveLastSettings(options.root, projectSettings),
+    ]);
+  }
 
   // Single source of truth for model/effort/provider. All mutations go through
   // applySettings so concurrent changes are serialized and the active provider
@@ -102,6 +137,9 @@ export async function startRepl(options: ReplOptions): Promise<void> {
     ...(options.effort ? { effort: options.effort } : {}),
     ...(options.providerType ? { providerType: options.providerType } : {}),
     ...(options.onUpdateProvider ? { onUpdateProvider: options.onUpdateProvider } : {}),
+    onCommit: (snapshot: SettingsSnapshot) => {
+      void persistSettings(snapshot);
+    },
   });
 
   /**
@@ -117,6 +155,85 @@ export async function startRepl(options: ReplOptions): Promise<void> {
     }
   };
 
+  /** Reloads the session/backup lists and redraws so the palette stays fresh. */
+  async function refreshSessions(): Promise<void> {
+    const [sessionList, backupList] = await Promise.all([
+      options.store.list().catch((): SessionMeta[] => []),
+      options.store.listBackups().catch((): SessionBackup[] => []),
+    ]);
+    sessions = sessionList;
+    backups = backupList;
+    draw();
+  }
+
+  /** Starts a fresh session seeded with the currently active settings. */
+  async function newSession(): Promise<string> {
+    const snapshot = settings.committed();
+    const meta = await options.store.create("tui", {
+      model: snapshot.model,
+      effort: snapshot.effort,
+      provider: snapshot.providerType,
+      permissionMode: currentPermissionMode,
+    });
+    sessionId = meta.id;
+    state = emptyTranscript();
+    draw();
+    await persistSettings(snapshot);
+    await refreshSessions();
+    return `Started new session ${meta.id}`;
+  }
+
+  /**
+   * Resumes a session: replays its transcript, restores its preserved settings
+   * (including permission mode) and switches the active provider accordingly.
+   */
+  async function switchSession(id: string): Promise<string> {
+    const meta = await options.store.getMeta(id);
+    if (!meta) return `✖ Session ${id} not found`;
+
+    sessionId = id;
+    state = transcriptFromEvents(await options.store.replay(id));
+
+    if (meta.settings?.permissionMode) {
+      currentPermissionMode = meta.settings.permissionMode;
+    }
+    currentPolicy = options.onUpdatePolicy
+      ? options.onUpdatePolicy(currentPermissionMode)
+      : createPolicy(currentPermissionMode);
+    draw();
+
+    const restored = meta.settings;
+    if (restored && (restored.model || restored.effort || restored.provider)) {
+      try {
+        await settings.applySettings({
+          ...(restored.model ? { model: restored.model } : {}),
+          ...(restored.effort ? { effort: restored.effort } : {}),
+          ...(restored.provider ? { provider: restored.provider } : {}),
+        });
+      } catch {
+        // Keep the previously active provider when the restored one cannot start.
+      }
+    }
+
+    draw();
+    await refreshSessions();
+    return `Resumed session ${id} (${meta.eventCount} events)`;
+  }
+
+  /** Backs up the active session and reports the backup path. */
+  async function backupSession(): Promise<string> {
+    const result = await options.store.backup(sessionId);
+    await refreshSessions();
+    return `✓ Backed up session to ${result.backupPath}`;
+  }
+
+  /** Restores a backup into a new session and switches to it. */
+  async function restoreBackup(backupPath: string): Promise<string> {
+    const restored = await options.store.restoreBackup(backupPath);
+    const message = await switchSession(restored.id);
+    return `Restored backup into ${restored.id}. ${message}`;
+  }
+
   const view = (): React.ReactElement => {
     const snapshot = settings.committed();
     return React.createElement(App, {
@@ -125,6 +242,9 @@ export async function startRepl(options: ReplOptions): Promise<void> {
       effort: snapshot.effort,
       permissionMode: currentPermissionMode,
       providerType: snapshot.providerType,
+      sessionId,
+      sessions,
+      backups,
       busy,
       permission: pending,
       onSubmit: (text: string) => {
@@ -153,8 +273,13 @@ export async function startRepl(options: ReplOptions): Promise<void> {
         } else {
           currentPolicy = createPolicy(newMode);
         }
+        void persistSettings(settings.committed());
         draw();
       },
+      onNewSession: () => newSession(),
+      onSwitchSession: (id: string) => switchSession(id),
+      onBackupSession: () => backupSession(),
+      onRestoreBackup: (path: string) => restoreBackup(path),
       ...(options.onOpenToken ? { onOpenToken: options.onOpenToken } : {}),
     });
   };
@@ -165,6 +290,9 @@ export async function startRepl(options: ReplOptions): Promise<void> {
 
   const instance = render(view());
 
+  // Seed the session lists so the palette is populated on first open.
+  void refreshSessions();
+
   async function turn(text: string): Promise<void> {
     busy = true;
     state = reduceTranscript(state, { type: "user_message", text });
@@ -172,7 +300,7 @@ export async function startRepl(options: ReplOptions): Promise<void> {
     const result = await runTurn({
       provider: settings.provider(),
       store: options.store,
-      sessionId: options.sessionId,
+      sessionId,
       policy: currentPolicy,
       root: options.root,
       tools: builtInTools(),
