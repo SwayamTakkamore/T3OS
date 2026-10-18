@@ -125,7 +125,25 @@ describe("LocalProvider", () => {
     });
 
     await collect(provider.streamChat([{ role: "user", content: "hi" }], []));
-    expect(received).toEqual({ cache_dir: "/tmp/t3os-hf-cache-test" });
+    expect(received).toEqual({ cache_dir: "/tmp/t3os-hf-cache-test", dtype: "q4" });
+  });
+
+  it("passes dtype q4 so Transformers.js loads the quantized weights, not fp32", async () => {
+    let received: unknown;
+    const provider = new LocalProvider({
+      modelId: "google/gemma-3-4b-it",
+      loadTransformers: async () => ({
+        pipeline: async (_task: string, _modelId: string, opts?: unknown) => {
+          received = opts;
+          return endStreamImmediately();
+        }
+      })
+    });
+
+    await collect(provider.streamChat([{ role: "user", content: "hi" }], []));
+    // Without `dtype`, @huggingface/transformers defaults to fp32 and resolves
+    // onnx/decoder_model_merged.onnx — the unquantized 16 GB graph.
+    expect(received).toMatchObject({ dtype: "q4" });
   });
 
   it("detects an installed model in the Hugging Face hub cache and passes its cache_dir", async () => {
@@ -137,8 +155,10 @@ describe("LocalProvider", () => {
       const snapshotDir = join(hubDir, "models--google--gemma-3-4b-it", "snapshots", "main");
       await mkdir(snapshotDir, { recursive: true });
       await writeFile(join(snapshotDir, "config.json"), "{}", "utf8");
-      // A usable cache must contain non-empty weight files, not just config.
-      await writeFile(join(snapshotDir, "decoder_model_merged.onnx"), Buffer.alloc(1024 * 1024, 1));
+      // A usable cache must contain the quantized Q4 weights T3OS loads,
+      // not just config — and never 0-byte placeholders.
+      await writeFile(join(snapshotDir, "decoder_model_merged_q4.onnx"), Buffer.alloc(1024 * 1024, 1));
+      await writeFile(join(snapshotDir, "decoder_model_merged_q4.onnx_data"), Buffer.alloc(1024 * 1024, 1));
 
       let received: unknown;
       const provider = new LocalProvider({
@@ -152,7 +172,7 @@ describe("LocalProvider", () => {
       });
 
       await collect(provider.streamChat([{ role: "user", content: "hi" }], []));
-      expect(received).toEqual({ cache_dir: hubDir });
+      expect(received).toEqual({ cache_dir: hubDir, dtype: "q4" });
     } finally {
       if (previousHome === undefined) delete process.env.HOME;
       else process.env.HOME = previousHome;
@@ -236,9 +256,10 @@ describe("LocalProvider", () => {
       const snapshotDir = join(hubDir, "models--onnx-community--gemma-3-4b-it-ONNX", "snapshots", "main");
       await mkdir(join(snapshotDir, "onnx"), { recursive: true });
       await writeFile(join(snapshotDir, "config.json"), "{}", "utf8");
-      // Non-empty ONNX weights are what makes the cache count as installed.
-      await writeFile(join(snapshotDir, "onnx", "embed_tokens.onnx"), Buffer.alloc(1024 * 1024, 1));
-      await writeFile(join(snapshotDir, "onnx", "decoder_model_merged.onnx"), Buffer.alloc(1024 * 1024, 1));
+      // Non-empty Q4 ONNX weights are what makes the cache count as installed.
+      await writeFile(join(snapshotDir, "onnx", "embed_tokens_q4.onnx"), Buffer.alloc(1024 * 1024, 1));
+      await writeFile(join(snapshotDir, "onnx", "decoder_model_merged_q4.onnx"), Buffer.alloc(1024 * 1024, 1));
+      await writeFile(join(snapshotDir, "onnx", "decoder_model_merged_q4.onnx_data"), Buffer.alloc(1024 * 1024, 1));
 
       let received: unknown;
       const provider = new LocalProvider({
@@ -252,7 +273,7 @@ describe("LocalProvider", () => {
       });
 
       await collect(provider.streamChat([{ role: "user", content: "hi" }], []));
-      expect(received).toEqual({ cache_dir: hubDir });
+      expect(received).toEqual({ cache_dir: hubDir, dtype: "q4" });
     } finally {
       if (previousHome === undefined) delete process.env.HOME;
       else process.env.HOME = previousHome;

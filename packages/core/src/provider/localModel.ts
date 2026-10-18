@@ -13,7 +13,7 @@ export const MODEL_ESTIMATED_SIZES: Record<string, string> = {
   "google/gemma-4-26B-A4B-it": "~14.5 GB (ONNX Q4)",
   "google/gemma-3-27b-it": "~15.0 GB (ONNX Q4)",
   "google/gemma-3-12b-it": "~7.0 GB (ONNX Q4)",
-  "google/gemma-3-4b-it": "~2.4 GB (ONNX Q4)",
+  "google/gemma-3-4b-it": "~3.2 GB (ONNX Q4)",
   "google/gemma-2-27b-it": "~15.0 GB (ONNX Q4)",
   "google/gemma-2-9b-it": "~5.5 GB (ONNX Q4)",
   "google/gemma-2-2b-it": "~1.5 GB (ONNX Q4)",
@@ -24,7 +24,7 @@ export const MODEL_TOTAL_BYTES: Record<string, number> = {
   "google/gemma-4-26B-A4B-it": 14.5 * 1024 * 1024 * 1024,
   "google/gemma-3-27b-it": 15.0 * 1024 * 1024 * 1024,
   "google/gemma-3-12b-it": 7.0 * 1024 * 1024 * 1024,
-  "google/gemma-3-4b-it": 2.4 * 1024 * 1024 * 1024,
+  "google/gemma-3-4b-it": 3.2 * 1024 * 1024 * 1024,
   "google/gemma-2-27b-it": 15.0 * 1024 * 1024 * 1024,
   "google/gemma-2-9b-it": 5.5 * 1024 * 1024 * 1024,
   "google/gemma-2-2b-it": 1.5 * 1024 * 1024 * 1024,
@@ -44,7 +44,7 @@ export function getModelEstimatedSize(modelId: string): string {
   if (lower.includes("26b")) return "~14.5 GB (ONNX Q4)";
   if (lower.includes("12b")) return "~7.0 GB (ONNX Q4)";
   if (lower.includes("9b")) return "~5.5 GB (ONNX Q4)";
-  if (lower.includes("4b")) return "~2.4 GB (ONNX Q4)";
+  if (lower.includes("4b")) return "~3.2 GB (ONNX Q4)";
   if (lower.includes("2b")) return "~1.5 GB (ONNX Q4)";
   return "~3.0 GB (ONNX Q4)";
 }
@@ -63,7 +63,7 @@ export function getModelTotalBytes(modelId: string): number {
   if (lower.includes("26b")) return 14.5 * 1024 * 1024 * 1024;
   if (lower.includes("12b")) return 7.0 * 1024 * 1024 * 1024;
   if (lower.includes("9b")) return 5.5 * 1024 * 1024 * 1024;
-  if (lower.includes("4b")) return 2.4 * 1024 * 1024 * 1024;
+  if (lower.includes("4b")) return 3.2 * 1024 * 1024 * 1024;
   if (lower.includes("2b")) return 1.5 * 1024 * 1024 * 1024;
   return 3.0 * 1024 * 1024 * 1024;
 }
@@ -190,6 +190,29 @@ interface CacheInspection {
   onnxGraphBytes: number;
   hasOnnxData: boolean;
   missingOnnxData: boolean;
+  /**
+   * True when a non-zero quantized decoder graph (`decoder_model_merged_q4.onnx`
+   * or `_quantized.onnx`) is present. This is the only graph `dtype: "q4"`
+   * Transformers.js can actually load, so an install without it is unusable.
+   */
+  quantizedDecoder: boolean;
+  /** True when any quantized (`_q4` / `_quantized`) weight variant is on disk. */
+  hasQuantizedWeights: boolean;
+  /** True when a non-zero unquantized `decoder_model_merged.onnx` is present. */
+  unquantizedDecoder: boolean;
+  /** True when any weight file exists as a 0-byte shell (an aborted download). */
+  zeroByteWeights: boolean;
+}
+
+/** Precision suffixes T3OS targets, in preference order (Q4 is the goal). */
+const PRECISION_SUFFIXES = ["_q4", "_quantized"] as const;
+
+/** ONNX sessions Transformers.js needs for `text-generation`. */
+const TEXT_SESSIONS = ["decoder_model_merged", "embed_tokens"] as const;
+
+/** True when an ONNX weight filename belongs to a quantized variant. */
+function isQuantizedWeightName(baseName: string): boolean {
+  return PRECISION_SUFFIXES.some((suffix) => baseName.includes(`${suffix}.onnx`));
 }
 
 async function inspectModelDir(dir: string): Promise<CacheInspection> {
@@ -198,17 +221,29 @@ async function inspectModelDir(dir: string): Promise<CacheInspection> {
   let zeroByteWeightSeen = false;
   let onnxGraphBytes = 0;
   let hasOnnxData = false;
+  let quantizedDecoder = false;
+  let hasQuantizedWeights = false;
+  let unquantizedDecoder = false;
 
   const noteFile = async (full: string, fileSize: number): Promise<void> => {
     sizeBytes += fileSize;
-    if (WEIGHT_EXTENSIONS.some((ext) => full.endsWith(ext))) {
-      weightFileCount += 1;
-      if (fileSize === 0) zeroByteWeightSeen = true;
-      if (full.endsWith(".onnx_data") || full.includes(".onnx_data")) {
-        hasOnnxData = true;
-      }
-      if (full.endsWith(".onnx") && !full.includes(".onnx_data")) {
-        onnxGraphBytes += fileSize;
+    if (!WEIGHT_EXTENSIONS.some((ext) => full.endsWith(ext))) return;
+
+    weightFileCount += 1;
+    if (fileSize === 0) zeroByteWeightSeen = true;
+    if (full.endsWith(".onnx_data") || full.includes(".onnx_data")) {
+      hasOnnxData = true;
+    }
+    if (full.endsWith(".onnx") && !full.includes(".onnx_data")) {
+      onnxGraphBytes += fileSize;
+      const base = full.slice(full.lastIndexOf("/") + 1);
+      if (isQuantizedWeightName(base)) {
+        hasQuantizedWeights = true;
+        if (base.startsWith("decoder_model_merged") && fileSize > 0) {
+          quantizedDecoder = true;
+        }
+      } else if (base === "decoder_model_merged.onnx" && fileSize > 0) {
+        unquantizedDecoder = true;
       }
     }
   };
@@ -251,14 +286,30 @@ async function inspectModelDir(dir: string): Promise<CacheInspection> {
 
   const missingOnnxData = onnxGraphBytes > 0 && onnxGraphBytes < 1024 * 1024 && !hasOnnxData;
 
+  // `dtype: "q4"` makes Transformers.js resolve `decoder_model_merged_q4.onnx`,
+  // so only a quantized decoder counts as a usable install. An unquantized
+  // decoder is the exact wrong-precision download this guard exists to catch.
   const complete =
     weightFileCount > 0 &&
     !zeroByteWeightSeen &&
     sizeBytes > 0 &&
     sizeBytes >= minInstalledBytes() &&
-    !missingOnnxData;
+    !missingOnnxData &&
+    quantizedDecoder;
 
-  return { found: true, complete, sizeBytes, weightFileCount, onnxGraphBytes, hasOnnxData, missingOnnxData };
+  return {
+    found: true,
+    complete,
+    sizeBytes,
+    weightFileCount,
+    onnxGraphBytes,
+    hasOnnxData,
+    missingOnnxData,
+    quantizedDecoder,
+    hasQuantizedWeights,
+    unquantizedDecoder,
+    zeroByteWeights: zeroByteWeightSeen,
+  };
 }
 
 /** Inspects a cache directory, preferring the `snapshots/main` HF layout. */
@@ -354,14 +405,33 @@ export async function checkLocalModelInstalled(
         incompleteInspection.onnxGraphBytes < 1024 * 1024 &&
         !incompleteInspection.hasOnnxData);
 
-    const details =
-      missingData && incompleteInspection.sizeBytes > 0 && total > 0
+    const hasWeights = incompleteInspection.weightFileCount > 0;
+    const noUsableWeights = !hasWeights || incompleteInspection.zeroByteWeights;
+
+    // Wrong precision on disk: an unquantized (or partially queued multi-
+    // precision) download. `dtype: "q4"` cannot load it, so the cache must be
+    // reported as needing the quantized files rather than as usable.
+    const wrongPrecision = hasWeights && !incompleteInspection.quantizedDecoder;
+
+    const details = missingData && incompleteInspection.sizeBytes > 0 && total > 0
         ? `Incomplete download: only ${formatBytes(
             incompleteInspection.sizeBytes
           )} of ${estimatedSize} downloaded (tensor weights .onnx_data missing or partial)`
-        : `Incomplete cache: only ${formatBytes(
-            incompleteInspection.sizeBytes
-          )} on disk (model weights missing or 0 bytes)`;
+        : noUsableWeights
+          ? `Incomplete cache: only ${formatBytes(
+              incompleteInspection.sizeBytes
+            )} on disk (model weights missing or 0 bytes)`
+          : wrongPrecision
+            ? `Incomplete cache: Q4 weights missing (found ${
+                incompleteInspection.unquantizedDecoder
+                  ? "unquantized decoder_model_merged.onnx only, "
+                  : "no quantized decoder graph, "
+              }${formatBytes(
+                incompleteInspection.sizeBytes
+              )} on disk). Local inference loads the \`_q4\` build — re-download to fetch onnx/decoder_model_merged_q4.onnx.`
+            : `Incomplete cache: only ${formatBytes(
+                incompleteInspection.sizeBytes
+              )} on disk (model weights missing or 0 bytes)`;
 
     return {
       modelId: normalized,
@@ -388,27 +458,67 @@ export async function checkLocalModelInstalled(
   };
 }
 
-/** Files fetched from the Hugging Face Hub, in download order (stage groups). */
+/**
+ * Files fetched from the Hugging Face Hub, in download order (stage groups).
+ *
+ * These default to the Q4 quantized build, which is what local inference loads
+ * via `dtype: "q4"`. ONNX community repos (e.g.
+ * `onnx-community/gemma-3-4b-it-ONNX`) keep every precision — unquantized fp32,
+ * fp16, q4, q4f16, quantized — plus a vision encoder in the same `onnx/`
+ * folder, so the discovery below filters down to just these Q4 text sessions.
+ */
 const ONNX_CONFIG_STAGE = ["config.json", "tokenizer.json", "tokenizer_config.json"];
-const ONNX_WEIGHT_STAGE = ["onnx/embed_tokens.onnx", "onnx/decoder_model_merged.onnx"];
-const ONNX_WEIGHT_DATA_STAGE = [
-  "onnx/embed_tokens.onnx_data",
-  "onnx/decoder_model_merged.onnx_data",
-  "onnx/decoder_model_merged.onnx_data_1",
-  "onnx/decoder_model_merged.onnx_data_2",
-  "onnx/decoder_model_merged.onnx_data_3",
-  "onnx/decoder_model_merged.onnx_data_4",
-  "onnx/decoder_model_merged.onnx_data_5",
-  "onnx/decoder_model_merged.onnx_data_6",
-  "onnx/decoder_model_merged.onnx_data_7",
-];
 const ONNX_GENERATION_STAGE = ["generation_config.json"];
+const ONNX_WEIGHT_STAGE = [
+  "onnx/embed_tokens_q4.onnx",
+  "onnx/decoder_model_merged_q4.onnx",
+];
+const ONNX_WEIGHT_DATA_STAGE = [
+  "onnx/embed_tokens_q4.onnx_data",
+  "onnx/decoder_model_merged_q4.onnx_data",
+  "onnx/decoder_model_merged_q4.onnx_data_1",
+];
 const ONNX_DOWNLOAD_FILES = [
   ...ONNX_CONFIG_STAGE,
   ...ONNX_WEIGHT_STAGE,
   ...ONNX_WEIGHT_DATA_STAGE,
   ...ONNX_GENERATION_STAGE,
 ];
+
+/**
+ * Picks the preferred precision suffix available for an ONNX session in a repo
+ * listing. Q4 wins, then the generic `quantized` build; "" means the repo only
+ * ships unquantized weights.
+ */
+function selectPrecisionSuffix(files: string[], session: string): string {
+  for (const suffix of PRECISION_SUFFIXES) {
+    if (files.includes(`onnx/${session}${suffix}.onnx`)) return suffix;
+  }
+  return "";
+}
+
+/**
+ * Reduces a full Hugging Face repo listing to just the targeted-precision
+ * text-generation weights and their companion tensor shards.
+ *
+ * Only `decoder_model_merged` and `embed_tokens` are selected: those are the
+ * sessions `text-generation` actually loads. Everything else under `onnx/` —
+ * other precisions (`_fp16`, `_q4f16`, unquantized fp32) and the
+ * `vision_encoder` — is deliberately excluded, since downloading it all is
+ * what inflated a 3.2 GB Q4 install into a 40.79 GB one.
+ */
+function selectTargetPrecisionFiles(files: string[]): string[] {
+  const selected: string[] = [];
+  for (const session of TEXT_SESSIONS) {
+    const suffix = selectPrecisionSuffix(files, session);
+    const graph = `onnx/${session}${suffix}.onnx`;
+    if (!files.includes(graph)) continue;
+    selected.push(graph);
+    // Companion tensor shards: `.onnx_data`, `.onnx_data_1`, `.onnx_data_2`, …
+    selected.push(...files.filter((f) => f.startsWith(`${graph}_`)));
+  }
+  return selected;
+}
 
 export async function discoverOnnxFiles(
   resolvedId: string,
@@ -420,17 +530,14 @@ export async function discoverOnnxFiles(
     if (!res.ok) return ONNX_DOWNLOAD_FILES;
     const data = (await res.json()) as { siblings?: Array<{ rfilename: string }> };
     const files: string[] = data.siblings?.map((s) => s.rfilename) || [];
-    const relevant = files.filter(
-      (f) =>
-        f.startsWith("onnx/") ||
-        ONNX_CONFIG_STAGE.includes(f) ||
-        ONNX_GENERATION_STAGE.includes(f),
-    );
-    if (relevant.length > 0) {
-      const onnxFiles = relevant.filter((f) => f.startsWith("onnx/"));
-      return Array.from(
-        new Set([...ONNX_CONFIG_STAGE, ...onnxFiles, ...ONNX_GENERATION_STAGE]),
-      );
+    const onnxFiles = files.filter((f) => f.startsWith("onnx/"));
+    if (onnxFiles.length > 0) {
+      const selected = selectTargetPrecisionFiles(onnxFiles);
+      if (selected.length > 0) {
+        return Array.from(
+          new Set([...ONNX_CONFIG_STAGE, ...selected, ...ONNX_GENERATION_STAGE]),
+        );
+      }
     }
   } catch {
     // ignore

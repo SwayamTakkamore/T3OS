@@ -40,6 +40,12 @@ type TextGenerator = (
 export interface TransformersPipelineOptions {
   /** Directory `@huggingface/transformers` uses to cache (and read) model files. */
   cache_dir?: string;
+  /**
+   * Weight variant to load. T3OS downloads and verifies the Q4 quantized
+   * build only; without this, Transformers.js defaults to fp32 and tries to
+   * resolve `onnx/decoder_model_merged.onnx` — the unquantized 16 GB graph.
+   */
+  dtype?: string;
 }
 
 export interface TransformersModule {
@@ -92,7 +98,7 @@ function formatModelLoadError(modelId: string, err: unknown): Error {
     return new Error(
       `${base}\n` +
         `Transformers.js runs models via ONNX and requires ONNX model files (e.g. ` +
-        `onnx/embed_tokens.onnx), which ${modelId} does not provide. ${suggestion}`
+        `onnx/embed_tokens_q4.onnx), which ${modelId} does not provide. ${suggestion}`
     );
   }
   return new Error(base);
@@ -130,6 +136,14 @@ async function defaultTransformersLoader(): Promise<TransformersModule> {
   return (await import(specifier)) as unknown as TransformersModule;
 }
 
+/**
+ * Weight variant T3OS targets for local inference. The model downloader only
+ * fetches the Q4 files (`decoder_model_merged_q4.onnx`, `embed_tokens_q4.onnx`
+ * plus their `.onnx_data` shards), so the pipeline must be told to resolve that
+ * same variant — Transformers.js otherwise defaults to fp32.
+ */
+export const LOCAL_MODEL_DTYPE = "q4";
+
 async function transformersGenerate(
   modelId: string,
   loadTransformers: TransformersLoader,
@@ -155,11 +169,13 @@ async function transformersGenerate(
   const resolvedId = resolveLocalModelId(modelId);
   let generator: TextGenerator;
   try {
-    generator = await mod.pipeline(
-      "text-generation",
-      resolvedId,
-      cacheDir ? { cache_dir: cacheDir } : undefined
-    );
+    // `dtype` must match the files the downloader fetched: T3OS installs the
+    // Q4 quantized build, and the default (fp32) would look for the unquantized
+    // `decoder_model_merged.onnx` instead.
+    generator = await mod.pipeline("text-generation", resolvedId, {
+      ...(cacheDir ? { cache_dir: cacheDir } : {}),
+      dtype: LOCAL_MODEL_DTYPE,
+    });
   } catch (err) {
     throw formatModelLoadError(modelId, err);
   }

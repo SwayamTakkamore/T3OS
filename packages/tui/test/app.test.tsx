@@ -165,7 +165,7 @@ describe("App", () => {
     // 6. Verify Step 2: Since not installed, asks if want to install with estimated file size!
     frame = lastFrame();
     expect(frame).toContain("Local Model Not Installed");
-    expect(frame).toContain("Estimated download size: ~2.4 GB");
+    expect(frame).toContain("Estimated download size: ~3.2 GB");
     expect(frame).toContain("[y] Install & Switch to Local");
 
     // 7. Confirm installation by pressing 'y'
@@ -585,7 +585,7 @@ describe("App", () => {
     expect(frame).toContain("google/gemma-3-4b-it");
     expect(frame).toContain("ONNX Model Repository");
     expect(frame).toContain("onnx-community/gemma-3-4b-it-ONNX");
-    expect(frame).toContain("~2.4 GB");
+    expect(frame).toContain("~3.2 GB");
     expect(frame).toContain("Size on Disk");
     expect(frame).toContain("✖ Not installed");
     expect(frame).toContain("Local cache path:");
@@ -841,10 +841,10 @@ describe("App", () => {
     mockLocalModelStatus = {
       modelId: "google/gemma-3-4b-it",
       isInstalled: false,
-      estimatedSize: "~2.4 GB (ONNX Q4)",
+      estimatedSize: "~3.2 GB (ONNX Q4)",
       path: "/tmp/fake/models--onnx-community--gemma-3-4b-it-ONNX",
       details:
-        "Incomplete download: only 19.7 MB of ~2.4 GB (ONNX Q4) downloaded (tensor weights .onnx_data missing or partial)",
+        "Incomplete download: only 19.7 MB of ~3.2 GB (ONNX Q4) downloaded (tensor weights .onnx_data missing or partial)",
       diskSizeBytes: 19.7 * 1024 * 1024,
       formattedDiskSize: "19.7 MB",
       incomplete: true,
@@ -883,7 +883,7 @@ describe("App", () => {
 
       frame = lastFrame();
       expect(frame).toContain("Settings Palette ▸ Check Model");
-      expect(frame).toContain("⚠ Incomplete download (19.7 MB of ~2.4 GB (ONNX Q4))");
+      expect(frame).toContain("⚠ Incomplete download (19.7 MB of ~3.2 GB (ONNX Q4))");
       expect(frame).toContain("Download & Complete Installation");
       // The "Switch to Local Mode" option is not offered when the download is incomplete.
       expect(frame).not.toContain("Switch Provider to Local Mode");
