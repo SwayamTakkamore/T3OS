@@ -1,7 +1,8 @@
-import { basename, dirname } from "node:path";
+import { join, sep } from "node:path";
+import { homedir } from "node:os";
 import { resolveLocalModelId, resolvePreset, type ModelPreset } from "../presets/index.js";
 import type { Delta, Message, ToolSchema } from "../types.js";
-import { checkLocalModelInstalled } from "./localModel.js";
+import { checkLocalModelInstalled, ensureFlatCacheLink } from "./localModel.js";
 import type { Provider, ProviderCapabilities, StreamOptions } from "./types.js";
 
 export type GenerateFn = (
@@ -46,6 +47,12 @@ export interface TransformersPipelineOptions {
    * resolve `onnx/decoder_model_merged.onnx` — the unquantized 16 GB graph.
    */
   dtype?: string;
+  /**
+   * Skip the network entirely. Only set once the model files are verified
+   * reachable in the local cache, so an installed model loads straight from
+   * disk instead of re-downloading, while a missing model can still fetch.
+   */
+  local_files_only?: boolean;
 }
 
 export interface TransformersModule {
@@ -104,25 +111,63 @@ function formatModelLoadError(modelId: string, err: unknown): Error {
   return new Error(base);
 }
 
+interface CacheResolution {
+  /** Directory handed to `@huggingface/transformers` as `cache_dir`, when known. */
+  cacheDir?: string | undefined;
+  /**
+   * True when the model's files are verified reachable at the flat
+   * `${cacheRoot}/${resolvedId}` path Transformers.js reads — the signal to
+   * pass `local_files_only: true` so nothing is re-downloaded.
+   */
+  localFilesOnly: boolean;
+}
+
 /**
  * Resolves the cache directory handed to `@huggingface/transformers`. An
  * explicit `cacheDir` always wins; otherwise a model already present in the
  * local Hugging Face hub cache is used so loading works without a round trip.
  * Both the raw model ID and its ONNX-converted equivalent are checked, since
  * the pipeline loads the resolved ONNX repo's files.
+ *
+ * Before returning, the flat `${hubDir}/${resolvedId}` path that
+ * `FileCache.resolve`s against `cache_dir` is linked to the installed
+ * snapshot (`ensureFlatCacheLink`), and `localFilesOnly` is only reported
+ * once that flat path holds a complete install — a legacy cache stored under
+ * a different repo id still falls back to downloading rather than failing
+ * offline.
  */
 async function resolveCacheDir(
   modelId: string,
   explicitCacheDir?: string
-): Promise<string | undefined> {
-  if (explicitCacheDir) return explicitCacheDir;
-  const candidates = [modelId, resolveLocalModelId(modelId)];
-  for (const candidate of candidates) {
-    const status = await checkLocalModelInstalled(candidate);
-    if (!status.isInstalled) continue;
-    if (basename(status.path).startsWith("models--")) return dirname(status.path);
+): Promise<CacheResolution> {
+  const resolvedId = resolveLocalModelId(modelId);
+  const cacheRoot = explicitCacheDir ?? join(homedir(), ".cache", "huggingface", "hub");
+
+  let installedPath: string | undefined;
+  // The pipeline loads `resolvedId`, so prefer a cache it can actually read.
+  for (const candidate of [resolvedId, modelId]) {
+    const status = await checkLocalModelInstalled(candidate, explicitCacheDir);
+    if (status.isInstalled) {
+      installedPath = status.path;
+      break;
+    }
   }
-  return undefined;
+
+  if (explicitCacheDir) {
+    const localFilesOnly = installedPath
+      ? await ensureFlatCacheLink(explicitCacheDir, resolvedId)
+      : false;
+    return { cacheDir: explicitCacheDir, localFilesOnly };
+  }
+
+  if (!installedPath) return { localFilesOnly: false };
+
+  // `FileCache` reads `${cache_dir}/org/repo/file`, so the hub root (both the
+  // `models--…` and the flat `org/repo` layouts live under it) is the right
+  // `cache_dir`; caches elsewhere keep the previous default-cache behaviour.
+  const cacheDir = installedPath.startsWith(cacheRoot + sep) ? cacheRoot : undefined;
+  const localFilesOnly = await ensureFlatCacheLink(cacheRoot, resolvedId);
+  return { cacheDir, localFilesOnly };
 }
 
 /**
@@ -163,7 +208,7 @@ async function transformersGenerate(
       `Ensure @huggingface/transformers is installed or configure an active local runtime.`
     );
   }
-  const cacheDir = await resolveCacheDir(modelId, options.cacheDir);
+  const { cacheDir, localFilesOnly } = await resolveCacheDir(modelId, options.cacheDir);
   // Transformers.js resolves weights from the repo's `onnx/` subfolder, so
   // map to the ONNX-converted repository when the canonical repo lacks one.
   const resolvedId = resolveLocalModelId(modelId);
@@ -171,9 +216,12 @@ async function transformersGenerate(
   try {
     // `dtype` must match the files the downloader fetched: T3OS installs the
     // Q4 quantized build, and the default (fp32) would look for the unquantized
-    // `decoder_model_merged.onnx` instead.
+    // `decoder_model_merged.onnx` instead. `local_files_only` (only set once
+    // the local cache is verified complete) stops Transformers.js from
+    // re-downloading files that are already on disk.
     generator = await mod.pipeline("text-generation", resolvedId, {
       ...(cacheDir ? { cache_dir: cacheDir } : {}),
+      ...(localFilesOnly ? { local_files_only: true } : {}),
       dtype: LOCAL_MODEL_DTYPE,
     });
   } catch (err) {

@@ -1,6 +1,6 @@
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import {
   checkLocalModelInstalled,
@@ -510,6 +510,130 @@ describe("localModel", () => {
     } finally {
       await rm(tempDir, { recursive: true, force: true });
     }
+  });
+
+  describe("flat Transformers.js cache link", () => {
+    /** Complete Q4 install under `snapshots/main`, matching what T3OS downloads. */
+    const writeCompleteSnapshot = async (snapshotDir: string): Promise<void> => {
+      await mkdir(join(snapshotDir, "onnx"), { recursive: true });
+      await writeFile(join(snapshotDir, "config.json"), "{}", "utf8");
+      await writeFile(join(snapshotDir, "tokenizer.json"), "{}", "utf8");
+      await writeFile(join(snapshotDir, "onnx", "embed_tokens_q4.onnx"), DUMMY_WEIGHT);
+      await writeFile(join(snapshotDir, "onnx", "decoder_model_merged_q4.onnx"), DUMMY_WEIGHT);
+      await writeFile(join(snapshotDir, "onnx", "decoder_model_merged_q4.onnx_data"), DUMMY_WEIGHT);
+    };
+
+    const snapshotPath = (hubDir: string) =>
+      join(hubDir, "models--onnx-community--gemma-3-4b-it-ONNX", "snapshots", "main");
+    const flatPath = (hubDir: string) =>
+      join(hubDir, "onnx-community", "gemma-3-4b-it-ONNX");
+
+    it("creates ${hubDir}/org/repo as a link to the snapshot after install", async () => {
+      const tempDir = await mkdtemp(join(tmpdir(), "t3os-test-hf-"));
+      try {
+        const result = await installLocalModel("google/gemma-3-4b-it", {
+          cacheDir: tempDir,
+          fetchImpl: createMockHfFetch(),
+        });
+        expect(result.success).toBe(true);
+
+        // Transformers.js FileCache resolves files at
+        // `${cache_dir}/${model_id}/${filename}`, so the flat org/repo path
+        // must lead into the HF snapshot layout or the next load re-downloads.
+        const linkStat = await lstat(flatPath(tempDir));
+        expect(linkStat.isSymbolicLink()).toBe(true);
+        expect(await realpath(flatPath(tempDir))).toBe(await realpath(snapshotPath(tempDir)));
+      } finally {
+        await rm(tempDir, { recursive: true, force: true });
+      }
+    });
+
+    it("auto-creates the flat link when a complete snapshot exists without one", async () => {
+      const tempDir = await mkdtemp(join(tmpdir(), "t3os-test-hf-"));
+      try {
+        await writeCompleteSnapshot(snapshotPath(tempDir));
+
+        const status = await checkLocalModelInstalled("google/gemma-3-4b-it", tempDir);
+        expect(status.isInstalled).toBe(true);
+
+        const linkStat = await lstat(flatPath(tempDir));
+        expect(linkStat.isSymbolicLink()).toBe(true);
+        expect(await realpath(flatPath(tempDir))).toBe(await realpath(snapshotPath(tempDir)));
+      } finally {
+        await rm(tempDir, { recursive: true, force: true });
+      }
+    });
+
+    it("replaces a broken flat link so Transformers.js can read the snapshot", async () => {
+      const tempDir = await mkdtemp(join(tmpdir(), "t3os-test-hf-"));
+      try {
+        await writeCompleteSnapshot(snapshotPath(tempDir));
+        // A leftover link to a purged download: exists on disk but resolves nowhere.
+        await mkdir(dirname(flatPath(tempDir)), { recursive: true });
+        await symlink(join(tempDir, "vanished-cache"), flatPath(tempDir));
+
+        const status = await checkLocalModelInstalled("google/gemma-3-4b-it", tempDir);
+        expect(status.isInstalled).toBe(true);
+
+        expect(await realpath(flatPath(tempDir))).toBe(await realpath(snapshotPath(tempDir)));
+      } finally {
+        await rm(tempDir, { recursive: true, force: true });
+      }
+    });
+
+    it("replaces an incomplete flat directory when the snapshot is complete", async () => {
+      const tempDir = await mkdtemp(join(tmpdir(), "t3os-test-hf-"));
+      try {
+        await writeCompleteSnapshot(snapshotPath(tempDir));
+        // Partial Transformers.js download at the flat path (the exact state
+        // the redundant-download bug leaves behind): config only, no weights.
+        await mkdir(flatPath(tempDir), { recursive: true });
+        await writeFile(join(flatPath(tempDir), "config.json"), "{}", "utf8");
+
+        const status = await checkLocalModelInstalled("google/gemma-3-4b-it", tempDir);
+        expect(status.isInstalled).toBe(true);
+
+        const linkStat = await lstat(flatPath(tempDir));
+        expect(linkStat.isSymbolicLink()).toBe(true);
+        expect(await realpath(flatPath(tempDir))).toBe(await realpath(snapshotPath(tempDir)));
+      } finally {
+        await rm(tempDir, { recursive: true, force: true });
+      }
+    });
+
+    it("keeps a flat directory that already holds a complete install", async () => {
+      const tempDir = await mkdtemp(join(tmpdir(), "t3os-test-hf-"));
+      try {
+        await writeCompleteSnapshot(flatPath(tempDir));
+
+        const status = await checkLocalModelInstalled("google/gemma-3-4b-it", tempDir);
+        expect(status.isInstalled).toBe(true);
+        expect(status.path).toContain(join("onnx-community", "gemma-3-4b-it-ONNX"));
+
+        // A real directory with the files is a valid cache for FileCache —
+        // it must not be replaced by a link.
+        const dirStat = await lstat(flatPath(tempDir));
+        expect(dirStat.isDirectory()).toBe(true);
+        expect(dirStat.isSymbolicLink()).toBe(false);
+      } finally {
+        await rm(tempDir, { recursive: true, force: true });
+      }
+    });
+
+    it("recognizes a complete install stored at the flat org/repo layout", async () => {
+      const tempDir = await mkdtemp(join(tmpdir(), "t3os-test-hf-"));
+      try {
+        await writeCompleteSnapshot(flatPath(tempDir));
+
+        const status = await checkLocalModelInstalled("google/gemma-3-4b-it", tempDir);
+        expect(status.isInstalled).toBe(true);
+        expect(status.incomplete).toBe(false);
+        expect(status.path).toContain(join("onnx-community", "gemma-3-4b-it-ONNX"));
+        expect(status.diskSizeBytes).toBeGreaterThan(0);
+      } finally {
+        await rm(tempDir, { recursive: true, force: true });
+      }
+    });
   });
 
   describe("discoverOnnxFiles", () => {

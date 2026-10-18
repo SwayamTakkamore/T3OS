@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { mkdir, open, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, open, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { GEMMA_ALIASES, resolveLocalModelId } from "../presets/index.js";
@@ -321,6 +321,59 @@ async function evaluateCacheDir(baseDir: string): Promise<CacheInspection | null
 }
 
 /**
+ * Ensures `${cacheRoot}/${modelId}` is readable by `@huggingface/transformers`'s
+ * `FileCache`, which resolves cached files at
+ * `path.join(cache_dir, model_id, filename)` — a flat `org/repo` layout that
+ * does not match the Python `huggingface_hub`
+ * `models--org--repo/snapshots/main` layout T3OS downloads into. Without this
+ * link, Transformers.js cannot see the installed files and re-downloads them.
+ *
+ * When a complete snapshot exists under `models--${sanitized}`, the flat path
+ * is symlinked into it (creating the parent directory as needed). A broken
+ * symlink or an incomplete directory at the flat path is replaced; a flat
+ * directory that already holds a complete install is left untouched.
+ *
+ * Returns `true` when `${cacheRoot}/${modelId}` resolves to a directory with a
+ * usable (complete) install afterwards. Never destroys the only copy of the
+ * files: replacement only happens when the snapshot side is itself complete.
+ * Failures are non-fatal — the current state is reported instead, so callers
+ * degrade to the previous download behaviour rather than crashing on a
+ * read-only cache directory.
+ */
+export async function ensureFlatCacheLink(
+  cacheRoot: string,
+  modelId: string
+): Promise<boolean> {
+  const flatPath = join(cacheRoot, modelId);
+  try {
+    // Already a complete install at the flat path (real files or a good link).
+    const direct = await evaluateCacheDir(flatPath);
+    if (direct?.complete) return true;
+
+    const sanitized = modelId.replace(/\//g, "--");
+    const hfDir = join(cacheRoot, `models--${sanitized}`);
+    const snapshotDir = existsSync(join(hfDir, "snapshots", "main"))
+      ? join(hfDir, "snapshots", "main")
+      : hfDir;
+
+    // Only replace what sits at the flat path when the snapshot side is
+    // itself complete — never remove the sole (possibly partial) copy.
+    const source = await evaluateCacheDir(snapshotDir);
+    if (!source?.complete) return false;
+
+    // `force` makes this a no-op when the path is absent; it removes broken
+    // symlinks (without following them) and incomplete directories.
+    await rm(flatPath, { recursive: true, force: true });
+    await mkdir(dirname(flatPath), { recursive: true });
+    await symlink(snapshotDir, flatPath);
+
+    return (await evaluateCacheDir(flatPath))?.complete ?? false;
+  } catch {
+    return (await evaluateCacheDir(flatPath))?.complete ?? false;
+  }
+}
+
+/**
  * Checks if a model's local cache or snapshot exists on disk and contains
  * real, usable weights. Both the canonical model ID and its ONNX-converted
  * equivalent are checked, since `@huggingface/transformers` loads the ONNX
@@ -367,6 +420,11 @@ export async function checkLocalModelInstalled(
       if (!inspection) continue;
 
       if (inspection.complete) {
+        // Transformers.js FileCache reads `${cache_root}/${model_id}/…` directly,
+        // so keep the flat path linked to this snapshot: the next load finds
+        // the files immediately instead of re-downloading them.
+        await ensureFlatCacheLink(hubDir, candidate);
+
         const details =
           `Found in local cache (${inspection.weightFileCount} weight file` +
           `${inspection.weightFileCount === 1 ? "" : "s"}, ${formatBytes(inspection.sizeBytes)} on disk)`;
@@ -749,6 +807,11 @@ export async function installLocalModel(
         status.details ?? "Verification failed: model weights are missing or empty."
       );
     }
+
+    // Mirror the snapshot at `${hubDir}/${resolvedId}` — the flat path
+    // Transformers.js's FileCache resolves against `cache_dir` — so the next
+    // load reads the installed files instead of downloading them again.
+    await ensureFlatCacheLink(hubDir, resolvedId);
 
     emit(
       100,

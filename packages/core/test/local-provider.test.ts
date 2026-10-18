@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -273,7 +273,109 @@ describe("LocalProvider", () => {
       });
 
       await collect(provider.streamChat([{ role: "user", content: "hi" }], []));
-      expect(received).toEqual({ cache_dir: hubDir, dtype: "q4" });
+      // `local_files_only` keeps Transformers.js on the local filesystem cache
+      // instead of re-downloading files that are already installed.
+      expect(received).toEqual({ cache_dir: hubDir, dtype: "q4", local_files_only: true });
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("passes cache_dir and local_files_only for an install at the flat org/repo layout", async () => {
+    const previousHome = process.env.HOME;
+    const home = await mkdtemp(join(tmpdir(), "t3os-hf-home-"));
+    try {
+      process.env.HOME = home;
+      const hubDir = join(home, ".cache", "huggingface", "hub");
+      // Files where Transformers.js's FileCache looks them up directly:
+      // `${cache_dir}/onnx-community/gemma-3-4b-it-ONNX/<file>`.
+      const flatDir = join(hubDir, "onnx-community", "gemma-3-4b-it-ONNX");
+      await mkdir(join(flatDir, "onnx"), { recursive: true });
+      await writeFile(join(flatDir, "config.json"), "{}", "utf8");
+      await writeFile(join(flatDir, "onnx", "embed_tokens_q4.onnx"), Buffer.alloc(1024 * 1024, 1));
+      await writeFile(join(flatDir, "onnx", "decoder_model_merged_q4.onnx"), Buffer.alloc(1024 * 1024, 1));
+      await writeFile(join(flatDir, "onnx", "decoder_model_merged_q4.onnx_data"), Buffer.alloc(1024 * 1024, 1));
+
+      let received: unknown;
+      const provider = new LocalProvider({
+        modelId: "google/gemma-3-4b-it",
+        loadTransformers: async () => ({
+          pipeline: async (_task: string, _modelId: string, opts?: unknown) => {
+            received = opts;
+            return endStreamImmediately();
+          }
+        })
+      });
+
+      await collect(provider.streamChat([{ role: "user", content: "hi" }], []));
+      expect(received).toEqual({ cache_dir: hubDir, dtype: "q4", local_files_only: true });
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("creates the flat org/repo link before handing cache_dir to the pipeline", async () => {
+    const previousHome = process.env.HOME;
+    const home = await mkdtemp(join(tmpdir(), "t3os-hf-home-"));
+    try {
+      process.env.HOME = home;
+      const hubDir = join(home, ".cache", "huggingface", "hub");
+      const snapshotDir = join(hubDir, "models--onnx-community--gemma-3-4b-it-ONNX", "snapshots", "main");
+      await mkdir(join(snapshotDir, "onnx"), { recursive: true });
+      await writeFile(join(snapshotDir, "config.json"), "{}", "utf8");
+      await writeFile(join(snapshotDir, "onnx", "embed_tokens_q4.onnx"), Buffer.alloc(1024 * 1024, 1));
+      await writeFile(join(snapshotDir, "onnx", "decoder_model_merged_q4.onnx"), Buffer.alloc(1024 * 1024, 1));
+      await writeFile(join(snapshotDir, "onnx", "decoder_model_merged_q4.onnx_data"), Buffer.alloc(1024 * 1024, 1));
+      const flatPath = join(hubDir, "onnx-community", "gemma-3-4b-it-ONNX");
+
+      let linkExistedDuringLoad = false;
+      const provider = new LocalProvider({
+        modelId: "google/gemma-3-4b-it",
+        loadTransformers: async () => ({
+          pipeline: async () => {
+            try {
+              const st = await lstat(flatPath);
+              linkExistedDuringLoad = st.isSymbolicLink();
+            } catch {
+              linkExistedDuringLoad = false;
+            }
+            return endStreamImmediately();
+          }
+        })
+      });
+
+      await collect(provider.streamChat([{ role: "user", content: "hi" }], []));
+      expect(linkExistedDuringLoad).toBe(true);
+      expect(await realpath(flatPath)).toBe(await realpath(snapshotDir));
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("omits local_files_only when no local install exists so the model can download", async () => {
+    const previousHome = process.env.HOME;
+    const home = await mkdtemp(join(tmpdir(), "t3os-hf-home-"));
+    try {
+      process.env.HOME = home;
+      let received: unknown;
+      const provider = new LocalProvider({
+        modelId: "google/gemma-3-4b-it",
+        loadTransformers: async () => ({
+          pipeline: async (_task: string, _modelId: string, opts?: unknown) => {
+            received = opts;
+            return endStreamImmediately();
+          }
+        })
+      });
+
+      await collect(provider.streamChat([{ role: "user", content: "hi" }], []));
+      expect(received).toEqual({ dtype: "q4" });
     } finally {
       if (previousHome === undefined) delete process.env.HOME;
       else process.env.HOME = previousHome;
