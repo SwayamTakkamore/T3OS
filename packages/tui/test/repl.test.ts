@@ -1,6 +1,42 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { LocalProvider, MockProvider, type EffortLevel, type Provider } from "@t3os/core";
-import { createReplSettings } from "../src/repl.js";
+import {
+  LocalProvider,
+  MockProvider,
+  SessionStore,
+  createPolicy,
+  type EffortLevel,
+  type Message,
+  type Provider,
+} from "@t3os/core";
+import { createReplSettings, startRepl } from "../src/repl.js";
+
+// `startRepl` renders through ink; capture the element instead of a real
+// terminal so the submitted text can be driven straight into `turn()`.
+const harness = vi.hoisted(() => ({
+  rendered: { current: null as Record<string, any> | null },
+}));
+
+vi.mock("ink", () => ({
+  render: (element: Record<string, any>) => {
+    harness.rendered.current = element;
+    return {
+      rerender: (next: Record<string, any>) => {
+        harness.rendered.current = next;
+      },
+      waitUntilExit: () => new Promise<void>(() => {}),
+      unmount: () => {},
+    };
+  },
+}));
+
+// The real App pulls in ink components the mocked ink module does not
+// provide; `turn()` is reached through the element props, not by rendering.
+vi.mock("../src/App.js", () => ({
+  App: () => null,
+}));
 
 const MODEL = "google/gemma-3-4b-it";
 const OTHER_MODEL = "google/gemma-3-12b-it";
@@ -101,5 +137,51 @@ describe("createReplSettings", () => {
       effort: "high",
       providerType: "local",
     });
+  });
+});
+
+describe("startRepl turn", () => {
+  it("passes the submitted text to runTurn as the prompt so the provider sees the user message", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "t3os-repl-turn-"));
+    const store = new SessionStore(dir);
+    const meta = await store.create("tui");
+
+    // Records the messages each provider call receives — the original bug
+    // handed the model an empty list, making Gemma degenerate.
+    const seen: Message[][] = [];
+    const recordingProvider: Provider = {
+      id: "recording",
+      capabilities: () => ({ toolCalling: false, streaming: true, contextLength: 8192 }),
+      async *streamChat(messages) {
+        seen.push(messages.map((m) => ({ ...m })));
+        yield { type: "done" };
+      },
+    };
+
+    try {
+      void startRepl({
+        provider: recordingProvider,
+        store,
+        sessionId: meta.id,
+        policy: createPolicy("ask"),
+        root: dir,
+        model: MODEL,
+      });
+
+      await vi.waitFor(() => {
+        expect(harness.rendered.current).toBeTruthy();
+      });
+
+      harness.rendered.current!.props.onSubmit("hello gemma");
+
+      await vi.waitFor(async () => {
+        const events = await store.replay(meta.id);
+        expect(events).toContainEqual({ type: "user_message", text: "hello gemma" });
+      });
+
+      expect(seen[0]?.[0]).toEqual({ role: "user", content: "hello gemma" });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });

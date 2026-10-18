@@ -11,16 +11,20 @@ export type GenerateFn = (
 ) => AsyncIterable<string>;
 
 export function renderPrompt(messages: Message[], preset: ModelPreset): string {
+  // A prompt must never open with a bare model turn: Gemma 3 degenerates into
+  // a repetition loop when it starts generating with zero user context, so an
+  // empty history gets a placeholder user turn instead.
+  const safe = messages.length > 0 ? messages : [{ role: "user" as const, content: "" }];
   if (preset.chatTemplate === "gemma") {
     const parts: string[] = [];
-    for (const message of messages) {
+    for (const message of safe) {
       const role = message.role === "assistant" ? "model" : message.role;
       parts.push(`<start_of_turn>${role}\n${message.content}<end_of_turn>\n`);
     }
     parts.push("<start_of_turn>model\n");
     return parts.join("");
   }
-  return messages.map((m) => `${m.role}: ${m.content}`).join("\n") + "\nassistant:";
+  return safe.map((m) => `${m.role}: ${m.content}`).join("\n") + "\nassistant:";
 }
 
 interface StreamerLike {
@@ -312,7 +316,23 @@ async function transformersGenerate(
       }
       if (next === "\u0000") return;
       if (typeof next === "string") {
-        yield next;
+        // Stop tokens (e.g. `<end_of_turn>`) must terminate generation:
+        // anything from the token onward is model scaffolding, and letting it
+        // through — or continuing past it — feeds repetition loops back to the
+        // renderer. Trim at the earliest stop token and end the stream.
+        let toYield = next;
+        let stopFound = false;
+        if (Array.isArray(opts.stopTokens)) {
+          for (const stop of opts.stopTokens) {
+            const idx = toYield.indexOf(stop);
+            if (idx !== -1) {
+              toYield = toYield.slice(0, idx);
+              stopFound = true;
+            }
+          }
+        }
+        if (toYield.length > 0) yield toYield;
+        if (stopFound) return;
       }
       // Skip non-string values (defensive)
     }

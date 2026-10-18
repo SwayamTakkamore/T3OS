@@ -2,8 +2,8 @@ import { lstat, mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { resolveLocalModelId } from "../src/presets/index.js";
-import { LocalProvider } from "../src/provider/local.js";
+import { resolveLocalModelId, resolvePreset } from "../src/presets/index.js";
+import { LocalProvider, renderPrompt } from "../src/provider/local.js";
 import type { Delta } from "../src/types.js";
 
 const collect = async (iter: AsyncIterable<Delta>): Promise<Delta[]> => {
@@ -467,6 +467,51 @@ describe("LocalProvider", () => {
     const textDeltas = deltas.filter((d) => d.type === "text");
     expect(textDeltas.length).toBeGreaterThan(0);
     expect(deltas).toContainEqual({ type: "done" });
+  });
+
+  it("trims text at the preset stop token and stops the stream there", async () => {
+    const provider = new LocalProvider({
+      modelId: "google/gemma-3-4b-it",
+      loadTransformers: async () => ({
+        pipeline: async () =>
+          async (
+            _prompt: string,
+            options: { streamer: { put(value: unknown): void; end(): void } }
+          ) => {
+            options.streamer.put("Hello");
+            options.streamer.put(" world<end_of_turn>must not leak");
+            options.streamer.put(" trailing chunk");
+            options.streamer.end();
+            return [];
+          }
+      })
+    });
+
+    const deltas = await collect(provider.streamChat([{ role: "user", content: "hi" }], []));
+    expect(deltas).toEqual([
+      { type: "text", text: "Hello" },
+      { type: "text", text: " world" },
+      { type: "done" }
+    ]);
+  });
+});
+
+describe("renderPrompt fallback", () => {
+  it("never starts the gemma prompt with an empty model turn when there are no messages", () => {
+    const preset = resolvePreset("google/gemma-3-4b-it");
+    const prompt = renderPrompt([], preset);
+    expect(prompt).not.toBe("<start_of_turn>model\n");
+    const userTurn = prompt.indexOf("<start_of_turn>user");
+    const modelTurn = prompt.indexOf("<start_of_turn>model");
+    expect(userTurn).toBeGreaterThanOrEqual(0);
+    expect(userTurn).toBeLessThan(modelTurn);
+  });
+
+  it("renders a user turn for an empty history with the generic template", () => {
+    const preset = resolvePreset("some/other-model");
+    const prompt = renderPrompt([], preset);
+    expect(prompt.startsWith("user:")).toBe(true);
+    expect(prompt.endsWith("assistant:")).toBe(true);
   });
 });
 

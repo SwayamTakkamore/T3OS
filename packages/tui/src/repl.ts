@@ -323,6 +323,7 @@ export async function startRepl(options: ReplOptions): Promise<void> {
       policy: currentPolicy,
       root: options.root,
       tools: builtInTools(),
+      prompt: text,
       onEvent: (event) => {
         state = reduceTranscript(state, event);
         draw();
