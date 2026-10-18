@@ -219,7 +219,8 @@ describe("localModel", () => {
       const status = await checkLocalModelInstalled("google/gemma-3-4b-it", tempDir);
       expect(status.isInstalled).toBe(false);
       expect(status.incomplete).toBe(true);
-      expect(status.details).toContain("Incomplete cache:");
+      expect(status.details).toContain("Incomplete download:");
+      expect(status.details).toContain(".onnx_data missing or partial");
     } finally {
       vi.unstubAllEnvs();
       await rm(tempDir, { recursive: true, force: true });
@@ -244,7 +245,8 @@ describe("localModel", () => {
       const onnxId = "onnx-community/gemma-3-4b-it-ONNX";
       const statusTexts = progressUpdates.map((p) => p.statusText);
       expect(statusTexts[0]).toContain(`Initializing download for ${onnxId}`);
-      expect(statusTexts.some((t) => t.includes("config.json") && t.includes("tokenizer.json"))).toBe(true);
+      expect(statusTexts.some((t) => t.includes("config.json"))).toBe(true);
+      expect(statusTexts.some((t) => t.includes("tokenizer.json"))).toBe(true);
       expect(statusTexts.some((t) => t.includes("onnx/embed_tokens.onnx"))).toBe(true);
       expect(statusTexts.some((t) => t.includes("onnx/decoder_model_merged.onnx"))).toBe(true);
       expect(statusTexts.some((t) => t.includes("Verifying ONNX graph integrity"))).toBe(true);
@@ -354,6 +356,47 @@ describe("localModel", () => {
       // Partially downloaded files are removed on cancellation
       const status = await checkLocalModelInstalled("google/gemma-3-4b-it", tempDir);
       expect(status.isInstalled).toBe(false);
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("returns incomplete when only ~19.7 MB exists for a 2.4 GB model", async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), "t3os-test-hf-"));
+    try {
+      const snapshotDir = join(
+        tempDir,
+        "models--onnx-community--gemma-3-4b-it-ONNX",
+        "snapshots",
+        "main"
+      );
+      await mkdir(join(snapshotDir, "onnx"), { recursive: true });
+      await writeFile(join(snapshotDir, "config.json"), "{}", "utf8");
+      await writeFile(join(snapshotDir, "tokenizer.json"), Buffer.alloc(2048, 1));
+      await writeFile(join(snapshotDir, "tokenizer_config.json"), "{}", "utf8");
+      await writeFile(join(snapshotDir, "generation_config.json"), "{}", "utf8");
+      await writeFile(join(snapshotDir, "onnx", "embed_tokens.onnx"), Buffer.alloc(435, 0));
+      await writeFile(join(snapshotDir, "onnx", "decoder_model_merged.onnx"), Buffer.alloc(351 * 1024, 0));
+      const tokenizer = Buffer.alloc(20.3 * 1024 * 1024, 1);
+      await writeFile(join(snapshotDir, "tokenizer.json"), tokenizer);
+      let total = 0;
+      for (const f of [
+        "config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "generation_config.json",
+        "onnx/embed_tokens.onnx",
+        "onnx/decoder_model_merged.onnx",
+      ]) {
+        const st = await stat(join(snapshotDir, f));
+        total += st.size;
+      }
+      const status = await checkLocalModelInstalled("google/gemma-3-4b-it", tempDir);
+      expect(status.isInstalled).toBe(false);
+      expect(status.incomplete).toBe(true);
+      expect(status.details).toContain("only");
+      expect(status.details).toContain("of");
+      expect(status.details).toContain(".onnx_data missing or partial");
     } finally {
       await rm(tempDir, { recursive: true, force: true });
     }

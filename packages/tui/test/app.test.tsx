@@ -5,6 +5,23 @@ import { App } from "../src/App.js";
 import { emptyTranscript } from "../src/transcript.js";
 import type { DownloadProgress } from "@t3os/core";
 
+// Mutable hook so individual tests can override the filesystem probe verdict
+// without affecting other tests (which fall through to the real implementation).
+let mockLocalModelStatus: Awaited<
+  ReturnType<typeof import("@t3os/core").checkLocalModelInstalled>
+> | null = null;
+
+vi.mock("@t3os/core", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@t3os/core")>();
+  return {
+    ...actual,
+    checkLocalModelInstalled: ((...args: Parameters<typeof actual.checkLocalModelInstalled>) =>
+      mockLocalModelStatus
+        ? Promise.resolve(mockLocalModelStatus)
+        : actual.checkLocalModelInstalled(...args)) as typeof actual.checkLocalModelInstalled,
+  };
+});
+
 const tick = (ms = 50) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const CTRL_P = "\x10";
@@ -818,5 +835,60 @@ describe("App", () => {
     frame = lastFrame();
     expect(frame).toContain("Settings Palette ▸ Check Model");
     expect(frame).toContain("30%");
+  });
+
+  it("shows Incomplete in the menu and Check Model view when the cache is partial (19.7 MB of 2.4 GB)", async () => {
+    mockLocalModelStatus = {
+      modelId: "google/gemma-3-4b-it",
+      isInstalled: false,
+      estimatedSize: "~2.4 GB (ONNX Q4)",
+      path: "/tmp/fake/models--onnx-community--gemma-3-4b-it-ONNX",
+      details:
+        "Incomplete download: only 19.7 MB of ~2.4 GB (ONNX Q4) downloaded (tensor weights .onnx_data missing or partial)",
+      diskSizeBytes: 19.7 * 1024 * 1024,
+      formattedDiskSize: "19.7 MB",
+      incomplete: true,
+    };
+
+    try {
+      const state = emptyTranscript();
+      const { stdin, lastFrame } = render(
+        <App
+          state={state}
+          model="google/gemma-3-4b-it"
+          effort="high"
+          providerType="hf"
+          onSubmit={() => {}}
+          onPermission={() => {}}
+        />,
+      );
+
+      await tick(150);
+
+      // Open the main settings palette and verify the Check Model row shows Incomplete.
+      stdin.write(CTRL_P);
+      await tick(150);
+
+      let frame = lastFrame();
+      expect(frame).toContain("Check Model");
+      expect(frame).toContain("Incomplete (19.7 MB)");
+
+      // Drill into Check Model view.
+      for (let i = 0; i < 4; i++) {
+        stdin.write(DOWN);
+        await tick(30);
+      }
+      stdin.write(ENTER);
+      await tick(150);
+
+      frame = lastFrame();
+      expect(frame).toContain("Settings Palette ▸ Check Model");
+      expect(frame).toContain("⚠ Incomplete download (19.7 MB of ~2.4 GB (ONNX Q4))");
+      expect(frame).toContain("Download & Complete Installation");
+      // The "Switch to Local Mode" option is not offered when the download is incomplete.
+      expect(frame).not.toContain("Switch Provider to Local Mode");
+    } finally {
+      mockLocalModelStatus = null;
+    }
   });
 });

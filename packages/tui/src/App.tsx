@@ -604,8 +604,9 @@ export function App({
       } else if (!isChecked) {
         // Check in flight: only safe actions are offered until it resolves.
       } else if (!installed) {
+        const incomplete = checkState?.status?.incomplete === true;
         items.push({
-          label: "Download & Install Model",
+          label: incomplete ? "Download & Complete Installation" : "Download & Install Model",
           value: getModelEstimatedSize(target),
           action: () => {
             void handleConfirmInstall(true);
@@ -842,6 +843,9 @@ export function App({
           }
           if (!checkState || checkState.loading) return "Checking…";
           if (checkState.error) return "Check failed";
+          if (checkState.status?.incomplete && !checkState.status?.isInstalled) {
+            return `Incomplete (${checkState.status.formattedDiskSize})`;
+          }
           return checkState.status?.isInstalled ? "Installed" : "Not installed";
         })(),
         action: () => {
@@ -1002,7 +1006,9 @@ export function App({
             ✓ Installed in local cache ({state.status.formattedDiskSize})
           </Text>
         ) : state?.status?.incomplete ? (
-          <Text color="yellow">⚠ Incomplete (weights missing or 0 bytes)</Text>
+          <Text color="yellow">
+            ⚠ Incomplete download ({state.status.formattedDiskSize} of {state.status.estimatedSize})
+          </Text>
         ) : state ? (
           <Text color="red">✖ Not installed</Text>
         ) : null}

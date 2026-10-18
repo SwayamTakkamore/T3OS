@@ -187,18 +187,29 @@ interface CacheInspection {
   complete: boolean;
   sizeBytes: number;
   weightFileCount: number;
+  onnxGraphBytes: number;
+  hasOnnxData: boolean;
+  missingOnnxData: boolean;
 }
 
 async function inspectModelDir(dir: string): Promise<CacheInspection> {
   let sizeBytes = 0;
   let weightFileCount = 0;
   let zeroByteWeightSeen = false;
+  let onnxGraphBytes = 0;
+  let hasOnnxData = false;
 
   const noteFile = async (full: string, fileSize: number): Promise<void> => {
     sizeBytes += fileSize;
     if (WEIGHT_EXTENSIONS.some((ext) => full.endsWith(ext))) {
       weightFileCount += 1;
       if (fileSize === 0) zeroByteWeightSeen = true;
+      if (full.endsWith(".onnx_data") || full.includes(".onnx_data")) {
+        hasOnnxData = true;
+      }
+      if (full.endsWith(".onnx") && !full.includes(".onnx_data")) {
+        onnxGraphBytes += fileSize;
+      }
     }
   };
 
@@ -238,13 +249,16 @@ async function inspectModelDir(dir: string): Promise<CacheInspection> {
 
   await walk(dir);
 
+  const missingOnnxData = onnxGraphBytes > 0 && onnxGraphBytes < 1024 * 1024 && !hasOnnxData;
+
   const complete =
     weightFileCount > 0 &&
     !zeroByteWeightSeen &&
     sizeBytes > 0 &&
-    sizeBytes >= minInstalledBytes();
+    sizeBytes >= minInstalledBytes() &&
+    !missingOnnxData;
 
-  return { found: true, complete, sizeBytes, weightFileCount };
+  return { found: true, complete, sizeBytes, weightFileCount, onnxGraphBytes, hasOnnxData, missingOnnxData };
 }
 
 /** Inspects a cache directory, preferring the `snapshots/main` HF layout. */
@@ -325,14 +339,36 @@ export async function checkLocalModelInstalled(
   }
 
   if (incompleteInspection) {
+    const total = getModelTotalBytes(normalized);
+    const isIncompleteByThreshold =
+      total > 0 &&
+      !(
+        process.env.VITEST === "true" || process.env.NODE_ENV === "test"
+      ) &&
+      incompleteInspection.sizeBytes < total * 0.7;
+
+    const missingData =
+      incompleteInspection.missingOnnxData ||
+      isIncompleteByThreshold ||
+      (incompleteInspection.onnxGraphBytes > 0 &&
+        incompleteInspection.onnxGraphBytes < 1024 * 1024 &&
+        !incompleteInspection.hasOnnxData);
+
+    const details =
+      missingData && incompleteInspection.sizeBytes > 0 && total > 0
+        ? `Incomplete download: only ${formatBytes(
+            incompleteInspection.sizeBytes
+          )} of ${estimatedSize} downloaded (tensor weights .onnx_data missing or partial)`
+        : `Incomplete cache: only ${formatBytes(
+            incompleteInspection.sizeBytes
+          )} on disk (model weights missing or 0 bytes)`;
+
     return {
       modelId: normalized,
       isInstalled: false,
       estimatedSize,
       path: incompletePath,
-      details: `Incomplete cache: only ${formatBytes(
-        incompleteInspection.sizeBytes
-      )} on disk (model weights missing or 0 bytes)`,
+      details,
       diskSizeBytes: incompleteInspection.sizeBytes,
       formattedDiskSize: formatBytes(incompleteInspection.sizeBytes),
       incomplete: true,
@@ -355,12 +391,52 @@ export async function checkLocalModelInstalled(
 /** Files fetched from the Hugging Face Hub, in download order (stage groups). */
 const ONNX_CONFIG_STAGE = ["config.json", "tokenizer.json", "tokenizer_config.json"];
 const ONNX_WEIGHT_STAGE = ["onnx/embed_tokens.onnx", "onnx/decoder_model_merged.onnx"];
+const ONNX_WEIGHT_DATA_STAGE = [
+  "onnx/embed_tokens.onnx_data",
+  "onnx/decoder_model_merged.onnx_data",
+  "onnx/decoder_model_merged.onnx_data_1",
+  "onnx/decoder_model_merged.onnx_data_2",
+  "onnx/decoder_model_merged.onnx_data_3",
+  "onnx/decoder_model_merged.onnx_data_4",
+  "onnx/decoder_model_merged.onnx_data_5",
+  "onnx/decoder_model_merged.onnx_data_6",
+  "onnx/decoder_model_merged.onnx_data_7",
+];
 const ONNX_GENERATION_STAGE = ["generation_config.json"];
 const ONNX_DOWNLOAD_FILES = [
   ...ONNX_CONFIG_STAGE,
   ...ONNX_WEIGHT_STAGE,
+  ...ONNX_WEIGHT_DATA_STAGE,
   ...ONNX_GENERATION_STAGE,
 ];
+
+export async function discoverOnnxFiles(
+  resolvedId: string,
+  fetchFn: typeof fetch,
+  headers: Record<string, string>
+): Promise<string[]> {
+  try {
+    const res = await fetchFn(`https://huggingface.co/api/models/${resolvedId}`, { headers });
+    if (!res.ok) return ONNX_DOWNLOAD_FILES;
+    const data = (await res.json()) as { siblings?: Array<{ rfilename: string }> };
+    const files: string[] = data.siblings?.map((s) => s.rfilename) || [];
+    const relevant = files.filter(
+      (f) =>
+        f.startsWith("onnx/") ||
+        ONNX_CONFIG_STAGE.includes(f) ||
+        ONNX_GENERATION_STAGE.includes(f),
+    );
+    if (relevant.length > 0) {
+      const onnxFiles = relevant.filter((f) => f.startsWith("onnx/"));
+      return Array.from(
+        new Set([...ONNX_CONFIG_STAGE, ...onnxFiles, ...ONNX_GENERATION_STAGE]),
+      );
+    }
+  } catch {
+    // ignore
+  }
+  return ONNX_DOWNLOAD_FILES;
+}
 
 /**
  * Downloads a model from the Hugging Face Hub into the Transformers.js cache
@@ -446,11 +522,13 @@ export async function installLocalModel(
       if (options?.signal?.aborted) throw new Error("Download cancelled by user");
     };
 
+    const filesToDownload = await discoverOnnxFiles(resolvedId, fetchFn, headers);
+
     // Preflight: HEAD each file so percent/ETA/totalBytes reflect the real
     // download size instead of the coarse per-model estimate. Failures leave
     // the estimate in place; the GET below surfaces any real error.
     const fileSizes = new Map<string, number>();
-    for (const file of ONNX_DOWNLOAD_FILES) {
+    for (const file of filesToDownload) {
       throwIfAborted();
       try {
         const head = await fetchFn(resolveUrl(file), {
@@ -465,8 +543,8 @@ export async function installLocalModel(
         throwIfAborted();
       }
     }
-    if (fileSizes.size === ONNX_DOWNLOAD_FILES.length) {
-      const knownTotal = ONNX_DOWNLOAD_FILES.reduce(
+    if (fileSizes.size > 0) {
+      const knownTotal = filesToDownload.reduce(
         (sum, file) => sum + (fileSizes.get(file) ?? 0),
         0
       );
@@ -524,25 +602,18 @@ export async function installLocalModel(
       }
     };
 
-    // Stage 1: config & tokenizer files at the snapshot root.
-    emitLive(
-      `Downloading ONNX model configuration & tokenizer (${resolvedId}/config.json, tokenizer.json)…`
-    );
-    for (const file of ONNX_CONFIG_STAGE) await downloadFile(file);
-
-    // Stage 2: token embeddings.
-    emitLive(`Downloading ONNX token embeddings (${resolvedId}/onnx/embed_tokens.onnx)…`);
-    await downloadFile(ONNX_WEIGHT_STAGE[0]!);
-
-    // Stage 3: decoder weights & computation graph (the bulk of the model).
-    emitLive(
-      `Downloading ONNX decoder weights & computation graph (${resolvedId}/onnx/decoder_model_merged.onnx)…`
-    );
-    await downloadFile(ONNX_WEIGHT_STAGE[1]!);
-
-    // Stage 4: generation config.
-    emitLive(`Downloading ONNX generation config and quantization metadata…`);
-    for (const file of ONNX_GENERATION_STAGE) await downloadFile(file);
+    for (const file of filesToDownload) {
+      try {
+        emitLive(`Downloading ${resolvedId}/${file}…`);
+        await downloadFile(file);
+      } catch (e) {
+        const err = e instanceof Error ? e.message : String(e);
+        if (err.includes("HTTP 404")) {
+          continue;
+        }
+        throw e;
+      }
+    }
 
     throwIfAborted();
     emitLive(`Verifying ONNX graph integrity and local tensor cache…`);
