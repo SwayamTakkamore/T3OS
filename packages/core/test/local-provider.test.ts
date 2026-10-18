@@ -687,6 +687,24 @@ describe("renderPrompt with tools", () => {
     expect(prompt.endsWith("\nassistant:")).toBe(true);
   });
 
+  it("includes conversational vs action mode guidance in tool instructions", () => {
+    const preset = resolvePreset("google/gemma-3-4b-it");
+    const prompt = renderPrompt([{ role: "user", content: "h" }], preset, tools);
+    expect(prompt).toContain("Guidelines on when to use tools vs conversational replies:");
+    expect(prompt).toContain("Conversational responses");
+    expect(prompt).toContain("Action requests");
+    expect(prompt).toContain("Do NOT invoke any tools");
+  });
+
+  it("maintains strictly alternating turns without back-to-back user turns in Gemma chat template", () => {
+    const preset = resolvePreset("google/gemma-3-4b-it");
+    const prompt = renderPrompt([{ role: "user", content: "hi" }], preset, tools);
+    // There must be no consecutive user turns: <end_of_turn>\n<start_of_turn>user
+    expect(prompt).not.toContain("<end_of_turn>\n<start_of_turn>user");
+    // Ensure the single user turn ends and is followed by the model turn
+    expect(prompt).toMatch(/<start_of_turn>user\n[\s\S]*\n\n---\n\nhi<end_of_turn>\n<start_of_turn>model\n$/);
+  });
+
   it("leaves the prompt unchanged when no tools are provided", () => {
     const preset = resolvePreset("google/gemma-3-4b-it");
     const withUndefined = renderPrompt([{ role: "user", content: "hi" }], preset);

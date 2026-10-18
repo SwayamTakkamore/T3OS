@@ -22,12 +22,20 @@ function renderToolInstructions(tools: ToolSchema[]): string {
     lines.push(`  parameters (JSON schema): ${JSON.stringify(tool.parameters)}`);
   }
   lines.push("");
+  lines.push("Guidelines on when to use tools vs conversational replies:");
+  lines.push(
+    "- Conversational responses: For greetings (e.g. \"hi\", \"hello\", \"hey\", \"h\"), casual chat, questions, explanations, or general brainstorming, respond naturally in plain conversational text. Do NOT invoke any tools."
+  );
+  lines.push(
+    "- Action requests: When the user explicitly or implicitly asks you to perform an action (such as creating/editing files, running shell commands, exploring directories, or searching code), invoke the appropriate tool directly."
+  );
+  lines.push("");
   lines.push("To invoke a tool, output a fenced JSON code block exactly like this:");
   lines.push("```json");
   lines.push('{ "name": "<tool_name>", "arguments": { ... } }');
   lines.push("```");
   lines.push(
-    'Use the tool\'s name from the list above and "arguments" matching its parameters. ' +
+    "Use the tool's name from the list above and \"arguments\" matching its parameters. " +
       "Invoke at most one tool per turn, then stop generating."
   );
   lines.push(
@@ -76,25 +84,45 @@ export function renderPrompt(
   // a repetition loop when it starts generating with zero user context, so an
   // empty history gets a placeholder user turn instead.
   const safe =
-    messages.length > 0 || toolInstructions !== undefined
+    messages.length > 0
       ? messages
       : [{ role: "user" as const, content: "" }];
+
   if (preset.chatTemplate === "gemma") {
     const parts: string[] = [];
-    if (toolInstructions !== undefined) {
-      parts.push(`<start_of_turn>user\n${toolInstructions}<end_of_turn>\n`);
-    }
+    let instructionsInjected = false;
     for (const message of safe) {
       const role = turnRole(message, "gemma");
-      parts.push(`<start_of_turn>${role}\n${renderMessageBody(message)}<end_of_turn>\n`);
+      let body = renderMessageBody(message);
+      // Prepend tool instructions to the first user turn so the conversation
+      // maintains strictly alternating turns instead of back-to-back user turns.
+      if (toolInstructions !== undefined && !instructionsInjected && role === "user") {
+        body = body.length > 0 ? `${toolInstructions}\n\n---\n\n${body}` : toolInstructions;
+        instructionsInjected = true;
+      }
+      parts.push(`<start_of_turn>${role}\n${body}<end_of_turn>\n`);
+    }
+    // If there were no user turns to prepend to, insert as the initial user turn.
+    if (toolInstructions !== undefined && !instructionsInjected) {
+      parts.unshift(`<start_of_turn>user\n${toolInstructions}<end_of_turn>\n`);
     }
     parts.push("<start_of_turn>model\n");
     return parts.join("");
   }
+
   const lines: string[] = [];
-  if (toolInstructions !== undefined) lines.push(`user: ${toolInstructions}`);
+  let instructionsInjected = false;
   for (const message of safe) {
-    lines.push(`${turnRole(message, "generic")}: ${renderMessageBody(message)}`);
+    const role = turnRole(message, "generic");
+    let body = renderMessageBody(message);
+    if (toolInstructions !== undefined && !instructionsInjected && role === "user") {
+      body = body.length > 0 ? `${toolInstructions}\n\n---\n\n${body}` : toolInstructions;
+      instructionsInjected = true;
+    }
+    lines.push(`${role}: ${body}`);
+  }
+  if (toolInstructions !== undefined && !instructionsInjected) {
+    lines.unshift(`user: ${toolInstructions}`);
   }
   return lines.join("\n") + "\nassistant:";
 }
