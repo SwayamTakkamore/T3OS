@@ -397,6 +397,77 @@ describe("LocalProvider", () => {
     expect(err.message).toContain("ONNX runtime: could not allocate buffer");
     expect(err.message).not.toMatch(/gated/i);
   });
+
+  it("passes bigint[][] into streamer.put does not yield BigInts and does not throw serialization error", async () => {
+    const provider = new LocalProvider({
+      modelId: "google/gemma-3-4b-it",
+      loadTransformers: async () => ({
+        pipeline: async (_task: string, _modelId: string, opts?: unknown) => {
+          return async (
+            _prompt: string,
+            options: { streamer: { put(value: unknown): void; end(): void } }
+          ) => {
+            // Simulate transformers passing bigint arrays to streamer
+            options.streamer.put([[123n]] as any);
+            options.streamer.end();
+            return [];
+          };
+        }
+      })
+    });
+
+    const deltas = await collect(provider.streamChat([{ role: "user", content: "hi" }], []));
+    // Should not contain any BigInt values and should complete successfully
+    const hasBigInt = deltas.some((d) => 
+      JSON.stringify(d).includes("BigInt") || 
+      (d.type === "text" && typeof d.text !== "string")
+    );
+    expect(hasBigInt).toBe(false);
+    expect(deltas).toContainEqual({ type: "done" });
+  });
+
+  it("handles TextStreamer integration smoothly", async () => {
+    const provider = new LocalProvider({
+      modelId: "google/gemma-3-4b-it",
+      loadTransformers: async () => ({
+        pipeline: async (_task: string, _modelId: string, opts?: unknown) => {
+          const generator = async (
+            _prompt: string,
+            options: { streamer: { put(value: unknown): void; end(): void } }
+          ) => {
+            options.streamer.put("hello");
+            options.streamer.put(" world");
+            options.streamer.end();
+            return [{ generated_text: "hello world" }];
+          };
+          (generator as any).tokenizer = { decode: () => "test" };
+          return generator;
+        },
+        TextStreamer: class MockTextStreamer {
+          tokenizer: any;
+          options: any;
+          constructor(tokenizer: any, options: any) {
+            this.tokenizer = tokenizer;
+            this.options = options;
+          }
+          put(value: unknown) {
+            // Simulate decoding
+            if (this.options.callback_function && typeof value !== "object") {
+              this.options.callback_function(String(value));
+            }
+          }
+          end() {
+            // no-op
+          }
+        }
+      })
+    });
+
+    const deltas = await collect(provider.streamChat([{ role: "user", content: "hi" }], []));
+    const textDeltas = deltas.filter((d) => d.type === "text");
+    expect(textDeltas.length).toBeGreaterThan(0);
+    expect(deltas).toContainEqual({ type: "done" });
+  });
 });
 
 describe("resolveLocalModelId", () => {

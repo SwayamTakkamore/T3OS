@@ -24,7 +24,7 @@ export function renderPrompt(messages: Message[], preset: ModelPreset): string {
 }
 
 interface StreamerLike {
-  put(value: string): void;
+  put(value: unknown): void;
   end(): void;
 }
 
@@ -61,6 +61,7 @@ export interface TransformersModule {
     modelId: string,
     options?: TransformersPipelineOptions
   ): Promise<TextGenerator>;
+  TextStreamer?: unknown;
 }
 
 export type TransformersLoader = () => Promise<TransformersModule>;
@@ -229,29 +230,91 @@ async function transformersGenerate(
   }
   return async function* generate(prompt, opts) {
     const queue: string[] = [];
-    const streamer: StreamerLike = {
-      put(value: string) {
-        queue.push(value);
-      },
-      end() {
-        queue.push("\u0000");
-      }
-    };
+    let generatorError: unknown = null;
+
+    let streamer: StreamerLike;
+    const useTextStreamer = Boolean(mod.TextStreamer && (generator as any).tokenizer);
+    if (useTextStreamer) {
+      const TextStreamerClass = mod.TextStreamer as any;
+      const tokenizer = (generator as any).tokenizer;
+      let origEnd: (() => void) | undefined;
+      const textStreamer: any = new TextStreamerClass(tokenizer, {
+        skip_prompt: true,
+        skip_special_tokens: true,
+        callback_function: (chunk: string) => {
+          if (typeof chunk === "string" && chunk.length > 0) {
+            queue.push(chunk);
+          }
+        }
+      });
+      origEnd = textStreamer.end.bind(textStreamer);
+      streamer = {
+        put(value: unknown) {
+          // TextStreamer handles token decoding internally via callback
+          textStreamer.put(value);
+        },
+        end() {
+          if (origEnd) origEnd();
+          queue.push("\u0000");
+        }
+      };
+    } else {
+      streamer = {
+        put(value: unknown) {
+          if (typeof value === "string" && value.length > 0) {
+            queue.push(value);
+          }
+          // Ignore non-string values (including bigint arrays) from raw generators
+        },
+        end() {
+          queue.push("\u0000");
+        }
+      };
+    }
+
     const outcome = generator(prompt, {
       max_new_tokens: opts.maxTokens,
       temperature: opts.temperature,
       do_sample: opts.temperature > 0,
       streamer
-    });
-    void outcome;
+    })
+      .then((output: any) => {
+        if (queue.length === 0 && output) {
+          const text = Array.isArray(output) && output[0]?.generated_text
+            ? output[0].generated_text
+            : typeof output === "string"
+              ? output
+              : "";
+          if (text) {
+            const answer = text.startsWith(prompt) ? text.slice(prompt.length) : text;
+            if (answer) queue.push(answer);
+          }
+        }
+        if (!queue.includes("\u0000")) {
+          queue.push("\u0000");
+        }
+      })
+      .catch((err) => {
+        generatorError = err;
+        if (!queue.includes("\u0000")) {
+          queue.push("\u0000");
+        }
+      });
+
     for (;;) {
       if (queue.length === 0) {
         await new Promise((resolve) => setTimeout(resolve, 5));
         continue;
       }
       const next = queue.shift()!;
+      if (generatorError !== null && queue.length === 0 && next === "\u0000") {
+        throw generatorError;
+      }
       if (next === "\u0000") return;
-      yield next;
+      if (typeof next === "string") {
+        yield next;
+      }
+      // Skip non-string values (defensive)
     }
   };
 }
