@@ -26,6 +26,19 @@ export const HARD_DENY_PATTERNS: RegExp[] = [
   /\bchmod\s+(-R\s+)?777\s+\//,
 ];
 
+/**
+ * The command a shell tool call will run. Must read the same keys in the same
+ * order as `run_shell`, or a command under a lower-priority key could run
+ * without passing the hard-deny check.
+ */
+function shellCommand(args: Record<string, unknown>): string | undefined {
+  for (const key of ["command", "cmd", "script"]) {
+    const value = args[key];
+    if (typeof value === "string") return value;
+  }
+  return undefined;
+}
+
 function matrix(mode: PermissionMode, toolClass: ToolClass): PermissionDecision {
   if (toolClass === "read") return { outcome: "allow" };
   if (mode === "auto-accept") return { outcome: "allow" };
@@ -40,8 +53,8 @@ export function createPolicy(mode: PermissionMode): PermissionPolicy {
     mode,
     evaluate(request: PermissionRequest): PermissionDecision {
       if (request.toolClass === "execute") {
-        const command = request.args["command"];
-        if (typeof command === "string") return this.checkShell(command);
+        const command = shellCommand(request.args);
+        if (command !== undefined) return this.checkShell(command);
       }
       return matrix(mode, request.toolClass);
     },

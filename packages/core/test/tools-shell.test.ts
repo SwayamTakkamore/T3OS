@@ -58,6 +58,30 @@ describe("runShellTool", () => {
     expect(result.data).toMatchObject({ exitCode: 7 });
   });
 
+  it.each<[string, unknown]>([
+    ["cmd", { cmd: "echo via-alias" }],
+    ["script", { script: "echo via-alias" }],
+    ["a bare string", "echo via-alias"]
+  ])("runs a command given as %s", async (_label, args) => {
+    const result = await runShellTool.run(args, { root });
+    expect(result.ok).toBe(true);
+    expect(result.content).toBe("via-alias");
+  });
+
+  it("prefers command over cmd and script", async () => {
+    const result = await runShellTool.run(
+      { command: "echo primary", cmd: "echo secondary", script: "echo tertiary" },
+      { root },
+    );
+    expect(result.content).toBe("primary");
+  });
+
+  it("reports a missing command", async () => {
+    const result = await runShellTool.run({}, { root });
+    expect(result.ok).toBe(false);
+    expect(result.content).toContain("missing required argument 'command'");
+  });
+
   it("rejects a cwd that escapes the workspace root", async () => {
     await expect(
       runShellTool.run({ command: "pwd", cwd: "../.." }, { root }),

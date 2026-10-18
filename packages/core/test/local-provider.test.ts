@@ -17,6 +17,22 @@ const collect = async (iter: AsyncIterable<Delta>): Promise<Delta[]> => {
   return out;
 };
 
+/** Streams `block` as the model's reply to a tool-wanting request and returns the tool call parsed from it. */
+const streamToolCall = async (
+  block: string,
+  tools: ToolSchema[]
+): Promise<{ name: string; args: unknown } | undefined> => {
+  async function* generate() {
+    yield block;
+  }
+  const provider = new LocalProvider({ modelId: "google/gemma-3-4b-it", generate });
+  const deltas = await collect(provider.streamChat([{ role: "user", content: "run it" }], tools));
+  const start = deltas.find((d) => d.type === "tool_call_start");
+  const delta = deltas.find((d) => d.type === "tool_call_delta");
+  if (start?.type !== "tool_call_start" || delta?.type !== "tool_call_delta") return undefined;
+  return { name: start.name, args: JSON.parse(delta.argsJsonDelta) };
+};
+
 /** The role of every turn opened in a Gemma prompt, in order. */
 const gemmaTurnRoles = (prompt: string): string[] =>
   [...prompt.matchAll(/<start_of_turn>(\w+)\n/g)].map((match) => match[1] ?? "");
@@ -624,31 +640,33 @@ describe("LocalProvider", () => {
     expect(text).toContain('"name":"no_such_tool"');
   });
 
-  it("withholds tool schemas and tool-call parsing for a greeting", async () => {
-    let seenPrompt = "";
-    // A tool-attracted model answering a greeting with an edit_file call.
-    const generate: GenerateFn = async function* (prompt) {
-      seenPrompt = prompt;
-      yield '```json\n{"name":"edit_file","arguments":{"path":"a.ts","oldString":"a","newString":"b"}}\n```';
-    };
-    const provider = new LocalProvider({ modelId: "google/gemma-3-4b-it", generate });
-    const tools: ToolSchema[] = [
-      { name: "edit_file", description: "Edit a file", parameters: { type: "object" } }
-    ];
-    const deltas = await collect(
-      provider.streamChat([{ role: "user", content: "hi cutieeee" }], tools)
-    );
+  it.each(["hi cutieeee", "how's going cutieee?"])(
+    "withholds tool schemas and tool-call parsing for the chat message %j",
+    async (content) => {
+      let seenPrompt = "";
+      // A tool-attracted model answering small talk with a write_file call.
+      const generate: GenerateFn = async function* (prompt) {
+        seenPrompt = prompt;
+        yield '```json\n{"name":"write_file","arguments":{"path":"a.ts","content":"x"}}\n```';
+      };
+      const provider = new LocalProvider({ modelId: "google/gemma-3-4b-it", generate });
+      const tools: ToolSchema[] = [
+        { name: "write_file", description: "Write a file", parameters: { type: "object" } },
+        { name: "edit_file", description: "Edit a file", parameters: { type: "object" } }
+      ];
+      const deltas = await collect(provider.streamChat([{ role: "user", content }], tools));
 
-    expect(seenPrompt).toBe("<start_of_turn>user\nhi cutieeee<end_of_turn>\n<start_of_turn>model\n");
-    expect(seenPrompt).not.toContain("You have access to the following tools");
-    expect(deltas.some((d) => d.type.startsWith("tool_call"))).toBe(false);
-    const text = deltas
-      .filter((d): d is Extract<Delta, { type: "text" }> => d.type === "text")
-      .map((d) => d.text)
-      .join("");
-    expect(text).toContain('"name":"edit_file"');
-    expect(deltas.at(-1)).toEqual({ type: "done" });
-  });
+      expect(seenPrompt).toBe(`<start_of_turn>user\n${content}<end_of_turn>\n<start_of_turn>model\n`);
+      expect(seenPrompt).not.toContain("You have access to the following tools");
+      expect(deltas.some((d) => d.type.startsWith("tool_call"))).toBe(false);
+      const text = deltas
+        .filter((d): d is Extract<Delta, { type: "text" }> => d.type === "text")
+        .map((d) => d.text)
+        .join("");
+      expect(text).toContain('"name":"write_file"');
+      expect(deltas.at(-1)).toEqual({ type: "done" });
+    }
+  );
 
   it("keeps tools available mid tool loop even when the user opened with a greeting", async () => {
     let seenPrompt = "";
@@ -679,19 +697,32 @@ describe("shouldProvideTools", () => {
   ];
   const user = (content: string): Message[] => [{ role: "user", content }];
 
-  it.each(["h", "hi", "hello", "hey", "hi cutieeee", "how are you", "thanks", "I'm saying... hi"])(
-    "withholds tools for the conversational message %j",
-    (content) => {
-      expect(shouldProvideTools(user(content), tools)).toBe(false);
-    }
-  );
+  it.each([
+    "h",
+    "hi",
+    "hello",
+    "hey",
+    "hi cutieeee",
+    "how are you",
+    "thanks",
+    "I'm saying... hi",
+    "how's going cutieee?",
+    "how are you?",
+    "who are you?",
+    "tell me a joke",
+    "what is a closure?"
+  ])("withholds tools for the conversational message %j", (content) => {
+    expect(shouldProvideTools(user(content), tools)).toBe(false);
+  });
 
   it.each([
     "create index.html",
     "ls",
     "run tests",
     "in this folder.. create a single page website",
-    "hi, list the files"
+    "hi, list the files",
+    "show package.json",
+    "git status"
   ])("provides tools for the action request %j", (content) => {
     expect(shouldProvideTools(user(content), tools)).toBe(true);
   });
@@ -743,13 +774,78 @@ describe("shouldProvideTools", () => {
     ).toBe(true);
   });
 
-  it("keeps tools for messages it cannot classify as conversational", () => {
-    expect(shouldProvideTools(user("yes please"), tools)).toBe(true);
-    expect(shouldProvideTools([], tools)).toBe(true);
+  it("withholds tools when no user message shows workspace intent", () => {
+    expect(shouldProvideTools(user("yes please"), tools)).toBe(false);
+    expect(shouldProvideTools([], tools)).toBe(false);
   });
 
   it("provides nothing when no tools are available", () => {
     expect(shouldProvideTools(user("create index.html"), [])).toBe(false);
+  });
+});
+
+describe("tool call aliasing", () => {
+  const readFile: ToolSchema = { name: "read_file", description: "Read a file", parameters: { type: "object" } };
+  const tools: ToolSchema[] = [
+    { name: "run_shell", description: "Run a shell command", parameters: { type: "object" } },
+    readFile,
+    { name: "write_file", description: "Write a file", parameters: { type: "object" } },
+    { name: "edit_file", description: "Edit a file", parameters: { type: "object" } },
+    { name: "list_dir", description: "List a directory", parameters: { type: "object" } }
+  ];
+  const fence = (payload: unknown): string => "```json\n" + JSON.stringify(payload) + "\n```";
+
+  it.each(["bash", "sh", "shell", "terminal", "execute", "run_command", "Bash"])(
+    "parses a %j tool call as run_shell",
+    async (name) => {
+      expect(await streamToolCall(fence({ name, arguments: { command: "ls -la" } }), tools)).toEqual({
+        name: "run_shell",
+        args: { command: "ls -la" }
+      });
+    }
+  );
+
+  it.each<[string, unknown, Record<string, unknown>]>([
+    ["cmd", { cmd: "git status" }, { command: "git status" }],
+    ["script", { script: "git status" }, { command: "git status" }],
+    ["a bare string", "git status", { command: "git status" }],
+    ["a double-encoded string", JSON.stringify("git status"), { command: "git status" }],
+    ["cmd beside other arguments", { cmd: "git status", cwd: "sub" }, { command: "git status", cwd: "sub" }]
+  ])("normalizes run_shell arguments given as %s into command", async (_label, args, expected) => {
+    for (const name of ["bash", "run_shell"]) {
+      expect(await streamToolCall(fence({ name, arguments: args }), tools)).toEqual({
+        name: "run_shell",
+        args: expected
+      });
+    }
+  });
+
+  it.each([
+    ["cat", "read_file"],
+    ["view_file", "read_file"],
+    ["create_file", "write_file"],
+    ["modify_file", "edit_file"],
+    ["ls", "list_dir"]
+  ])("parses a %j tool call as %s", async (alias, target) => {
+    expect(await streamToolCall(fence({ name: alias, arguments: { path: "a.ts" } }), tools)).toEqual({
+      name: target,
+      args: { path: "a.ts" }
+    });
+  });
+
+  it("prefers an available tool over the alias it shadows", async () => {
+    const withExecute: ToolSchema[] = [
+      ...tools,
+      { name: "execute", description: "Execute", parameters: { type: "object" } }
+    ];
+    expect(await streamToolCall(fence({ name: "execute", arguments: { cmd: "ls" } }), withExecute)).toEqual({
+      name: "execute",
+      args: { cmd: "ls" }
+    });
+  });
+
+  it("leaves an alias as plain text when its target tool is unavailable", async () => {
+    expect(await streamToolCall(fence({ name: "bash", arguments: { command: "ls" } }), [readFile])).toBeUndefined();
   });
 });
 

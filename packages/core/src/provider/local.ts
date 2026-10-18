@@ -225,24 +225,13 @@ function hasPathSyntax(text: string): boolean {
   return /[\w.~-]*[/\\][\w.-]/.test(text) || FILE_EXTENSION_PATTERN.test(text) || /`[^`]+`/.test(text);
 }
 
-/** Greetings, thanks, farewells, and reactions, tolerating elongation ("hiii", "heyyy"). */
-const CONVERSATIONAL_TOKEN_PATTERN =
-  /^(?:h+|h+i+|he+y+a*|hel+o+|hiy+a+|yo+|sup|howdy|hola|greetings|gm|gn|morning|evening|afternoon|th[ae]nks*|thank|thankyou|thx|ty|tysm|cheers|bye+|goodbye|cya|lol|lmao|ha(?:ha)+|he(?:he)+|cool|nice|wow|awesome|great|amazing|sweet)$/;
-
-const CONVERSATIONAL_PHRASES = [
-  "how are you", "how are u", "how r you", "how r u", "how's it going", "hows it going",
-  "how is it going", "how do you do", "what's up", "whats up", "wassup", "who are you",
-  "what are you", "what's your name", "whats your name", "nice to meet you", "good job",
-  "well done", "see you", "good night"
-];
-
 /**
  * Decides whether a turn should be offered tools at all. Small local models
  * are strongly attracted to tool schemas in the prompt: a 4B model answers
- * "hi" with an `edit_file` call despite instructions not to. So a latest user
- * message that is recognisably conversational and shows no sign of wanting
- * workspace work gets no tools. Anything unrecognised keeps them, and so does
- * a turn in the middle of a tool loop.
+ * "how's going?" with a `write_file` call despite instructions not to. So
+ * tools are offered only when the latest user message shows workspace intent
+ * — an action word or command, or path/file syntax — or mid tool loop.
+ * Everything else (greetings, chat, general questions) is answered without them.
  */
 export function shouldProvideTools(messages: Message[], tools: ToolSchema[]): boolean {
   if (tools.length === 0) return false;
@@ -254,7 +243,7 @@ export function shouldProvideTools(messages: Message[], tools: ToolSchema[]): bo
   for (let i = messages.length - 1; i >= 0 && !latestUser; i--) {
     if (messages[i]?.role === "user") latestUser = messages[i];
   }
-  if (!latestUser) return true;
+  if (!latestUser) return false;
   const text = latestUser.content.toLowerCase().replace(/[\u2018\u2019]/g, "'");
   if (hasPathSyntax(text)) return true;
 
@@ -262,13 +251,7 @@ export function shouldProvideTools(messages: Message[], tools: ToolSchema[]): bo
     .split(/[^a-z0-9']+/)
     .map((token) => token.replace(/^'+|'+$/g, ""))
     .filter((token) => token.length > 0);
-  if (tokens.some((token) => wordStems(token).some((stem) => ACTION_WORDS.has(stem)))) return true;
-
-  const phrase = ` ${tokens.join(" ")} `;
-  const conversational =
-    tokens.some((token) => CONVERSATIONAL_TOKEN_PATTERN.test(token)) ||
-    CONVERSATIONAL_PHRASES.some((candidate) => phrase.includes(` ${candidate} `));
-  return !conversational;
+  return tokens.some((token) => wordStems(token).some((stem) => ACTION_WORDS.has(stem)));
 }
 
 /** The fence marker the model is instructed to wrap tool invocations in. */
@@ -282,9 +265,52 @@ function nextToolCallId(): string {
 }
 
 /**
+ * Tool names small models reach for instead of the real ones (shell builtins,
+ * other agents' tool names), mapped to the tool they mean.
+ */
+const TOOL_NAME_ALIASES = new Map<string, string>([
+  ["bash", "run_shell"],
+  ["sh", "run_shell"],
+  ["shell", "run_shell"],
+  ["terminal", "run_shell"],
+  ["execute", "run_shell"],
+  ["run_command", "run_shell"],
+  ["cat", "read_file"],
+  ["view_file", "read_file"],
+  ["create_file", "write_file"],
+  ["modify_file", "edit_file"],
+  ["ls", "list_dir"]
+]);
+
+/**
+ * Resolves a model-supplied tool name to an available tool. An alias applies
+ * only when the name is not itself an available tool and its target is.
+ */
+function resolveToolName(name: string, tools: ToolSchema[]): string | undefined {
+  const available = (candidate: string): boolean => tools.some((tool) => tool.name === candidate);
+  if (available(name)) return name;
+  const target = TOOL_NAME_ALIASES.get(name.toLowerCase());
+  return target !== undefined && available(target) ? target : undefined;
+}
+
+/**
+ * Coerces the argument shapes small models give `run_shell` — a bare command
+ * string, or the command under `cmd`/`script` — into `{ command }`.
+ */
+function normalizeShellArgs(args: unknown): unknown {
+  if (typeof args === "string") return { command: args };
+  if (args === null || typeof args !== "object" || Array.isArray(args)) return args;
+  const { cmd, script, ...rest } = args as Record<string, unknown>;
+  if (typeof rest.command === "string") return args;
+  const command = typeof cmd === "string" ? cmd : typeof script === "string" ? script : undefined;
+  return command === undefined ? args : { ...rest, command };
+}
+
+/**
  * Recognises a tool invocation inside a fenced JSON block. Returns undefined
  * when the payload is not valid JSON, lacks `name`/`arguments`, or names a
- * tool that is not in the provided schema list — such blocks are plain text.
+ * tool that is neither in the provided schema list nor an alias of one — such
+ * blocks are plain text.
  */
 function parseToolCall(
   jsonText: string,
@@ -298,8 +324,9 @@ function parseToolCall(
   }
   if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
   const record = parsed as Record<string, unknown>;
-  const name = record.name;
-  if (typeof name !== "string" || !tools.some((tool) => tool.name === name)) return undefined;
+  if (typeof record.name !== "string") return undefined;
+  const name = resolveToolName(record.name, tools);
+  if (name === undefined) return undefined;
   if (!("arguments" in record)) return undefined;
   let args = record.arguments;
   // Some models double-encode arguments as a JSON string; unwrap it.
@@ -310,6 +337,7 @@ function parseToolCall(
       // keep the raw string
     }
   }
+  if (name === "run_shell") args = normalizeShellArgs(args);
   return { name, args };
 }
 

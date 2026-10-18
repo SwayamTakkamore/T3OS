@@ -125,7 +125,11 @@ export const runShellTool: Tool = {
   },
   async run(args: unknown, ctx: ToolContext): Promise<ToolResult> {
     assertNotAborted(ctx);
-    const command = asString(args, "command");
+    const command =
+      asString(args, "command") ??
+      asString(args, "cmd") ??
+      asString(args, "script") ??
+      (typeof args === "string" ? args : undefined);
     if (!command) {
       return { ok: false, content: "run_shell: missing required argument 'command'" };
     }

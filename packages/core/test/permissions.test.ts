@@ -28,6 +28,13 @@ describe("createPolicy", () => {
     expect(policy.evaluate({ tool: "write_file", toolClass: "write", args: {} }).outcome).toBe("allow");
     expect(policy.evaluate({ tool: "run_shell", toolClass: "execute", args: {} }).outcome).toBe("allow");
   });
+
+  it("hard-denies dangerous commands passed under cmd or script", () => {
+    const policy = createPolicy("auto-accept");
+    for (const args of [{ cmd: "rm -rf /" }, { script: "rm -rf /" }, { command: 5, cmd: "rm -rf /" }]) {
+      expect(policy.evaluate({ tool: "run_shell", toolClass: "execute", args }).outcome).toBe("deny");
+    }
+  });
 });
 
 describe("checkShell", () => {
