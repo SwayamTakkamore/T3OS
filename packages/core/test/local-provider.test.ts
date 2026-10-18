@@ -12,6 +12,10 @@ const collect = async (iter: AsyncIterable<Delta>): Promise<Delta[]> => {
   return out;
 };
 
+/** The role of every turn opened in a Gemma prompt, in order. */
+const gemmaTurnRoles = (prompt: string): string[] =>
+  [...prompt.matchAll(/<start_of_turn>(\w+)\n/g)].map((match) => match[1] ?? "");
+
 async function* fakeGenerate() {
   yield "loc";
   yield "al";
@@ -687,13 +691,38 @@ describe("renderPrompt with tools", () => {
     expect(prompt.endsWith("\nassistant:")).toBe(true);
   });
 
-  it("includes conversational vs action mode guidance in tool instructions", () => {
+  it("frames the tool-vs-conversation choice by what the request needs", () => {
     const preset = resolvePreset("google/gemma-3-4b-it");
     const prompt = renderPrompt([{ role: "user", content: "h" }], preset, tools);
-    expect(prompt).toContain("Guidelines on when to use tools vs conversational replies:");
-    expect(prompt).toContain("Conversational responses");
-    expect(prompt).toContain("Action requests");
-    expect(prompt).toContain("Do NOT invoke any tools");
+    expect(prompt).toContain("Decide whether to use a tool by what the request needs:");
+    expect(prompt).toContain(
+      "- When answering requires inspecting files, creating or editing files, exploring " +
+        "directories, searching code, or executing shell commands, invoke the appropriate " +
+        "tool directly."
+    );
+    expect(prompt).toContain(
+      '- For greetings (e.g. "h", "hi", "hello", "hey"), casual chat, general questions, or ' +
+        "explanations that do not require workspace access, respond conversationally in " +
+        "plain text. Do NOT invoke any tools."
+    );
+    // The tool-use bullet precedes the greeting bullet, and both follow the
+    // invocation format so the decision guidance is read last.
+    const format = prompt.indexOf("To invoke a tool, output a fenced JSON code block");
+    const toolBullet = prompt.indexOf("- When answering requires inspecting files");
+    const greetingBullet = prompt.indexOf('- For greetings (e.g. "h"');
+    expect(format).toBeGreaterThan(-1);
+    expect(format).toBeLessThan(toolBullet);
+    expect(toolBullet).toBeLessThan(greetingBullet);
+  });
+
+  it("ends the instruction block with the no-tools-for-greetings rule", () => {
+    const rule = "Do NOT invoke tools for casual greetings or general conversation.";
+    const gemma = renderPrompt([{ role: "user", content: "hi" }], resolvePreset("google/gemma-3-4b-it"), tools);
+    expect(gemma).toContain(`${rule}\n\n---\n\nhi<end_of_turn>`);
+    expect(gemma.indexOf(rule)).toBe(gemma.lastIndexOf(rule));
+
+    const generic = renderPrompt([{ role: "user", content: "hi" }], resolvePreset("some/other-model"), tools);
+    expect(generic).toContain(`${rule}\n\n---\n\nhi\nassistant:`);
   });
 
   it("maintains strictly alternating turns without back-to-back user turns in Gemma chat template", () => {
@@ -712,6 +741,131 @@ describe("renderPrompt with tools", () => {
     expect(withUndefined).toBe(withEmpty);
     expect(withUndefined).not.toContain("<tool_name>");
     expect(withUndefined).toBe("<start_of_turn>user\nhi<end_of_turn>\n<start_of_turn>model\n");
+  });
+
+  it("puts tool instructions in a single user turn when the history is empty", () => {
+    const rule = "Do NOT invoke tools for casual greetings or general conversation.";
+    const gemma = renderPrompt([], resolvePreset("google/gemma-3-4b-it"), tools);
+    expect(gemmaTurnRoles(gemma)).toEqual(["user", "model"]);
+    expect(gemma.startsWith("<start_of_turn>user\nYou have access to the following tools:")).toBe(true);
+    expect(gemma.endsWith(`${rule}<end_of_turn>\n<start_of_turn>model\n`)).toBe(true);
+    // No user content to separate the instructions from.
+    expect(gemma).not.toContain("\n---\n");
+
+    const generic = renderPrompt([], resolvePreset("some/other-model"), tools);
+    expect(generic.startsWith("user: You have access to the following tools:")).toBe(true);
+    expect(generic.endsWith(`${rule}\nassistant:`)).toBe(true);
+    expect(generic).not.toContain("\n---\n");
+  });
+});
+
+describe("renderPrompt turn merging", () => {
+  const gemma = resolvePreset("google/gemma-3-4b-it");
+  const tools: ToolSchema[] = [
+    { name: "execute", description: "Run a shell command", parameters: { type: "object" } }
+  ];
+
+  it("merges consecutive user turns into one Gemma user turn", () => {
+    // A turn that errored before the model replied leaves two user prompts in a row.
+    const prompt = renderPrompt(
+      [
+        { role: "user", content: "list the files" },
+        { role: "user", content: "hello?" }
+      ],
+      gemma
+    );
+    expect(prompt).toBe(
+      "<start_of_turn>user\nlist the files\n\nhello?<end_of_turn>\n<start_of_turn>model\n"
+    );
+  });
+
+  it("merges assistant text with a following tool-call message into one model turn", () => {
+    const prompt = renderPrompt(
+      [
+        { role: "user", content: "what is in src?" },
+        { role: "assistant", content: "Let me check." },
+        {
+          role: "assistant",
+          content: "",
+          toolCalls: [{ id: "c1", name: "execute", args: { command: "ls src" } }]
+        },
+        { role: "tool", name: "execute", toolCallId: "c1", content: "index.ts" }
+      ],
+      gemma,
+      tools
+    );
+    expect(gemmaTurnRoles(prompt)).toEqual(["user", "model", "user", "model"]);
+    expect(prompt).toContain(
+      "<start_of_turn>model\nLet me check.\n\n```json\n" +
+        '{"name":"execute","arguments":{"command":"ls src"}}\n```<end_of_turn>'
+    );
+  });
+
+  it("strictly alternates Gemma turns across tool results and follow-up prompts", () => {
+    const prompt = renderPrompt(
+      [
+        { role: "user", content: "run both" },
+        {
+          role: "assistant",
+          content: "",
+          toolCalls: [{ id: "c1", name: "execute", args: { command: "a" } }]
+        },
+        { role: "tool", name: "execute", toolCallId: "c1", content: "out a" },
+        { role: "tool", name: "execute", toolCallId: "c2", content: "out b" },
+        { role: "user", content: "thanks" }
+      ],
+      gemma,
+      tools
+    );
+    const roles = gemmaTurnRoles(prompt);
+    expect(roles).toEqual(["user", "model", "user", "model"]);
+    for (let i = 1; i < roles.length; i++) {
+      expect(roles[i]).not.toBe(roles[i - 1]);
+    }
+    expect(prompt).toContain(
+      "<start_of_turn>user\n[Tool Result for execute]: out a\n\n" +
+        "[Tool Result for execute]: out b\n\nthanks<end_of_turn>\n<start_of_turn>model\n"
+    );
+  });
+
+  it("prepends tool instructions to the first merged user turn only", () => {
+    const prompt = renderPrompt(
+      [
+        { role: "user", content: "first" },
+        { role: "user", content: "second" }
+      ],
+      gemma,
+      tools
+    );
+    expect(gemmaTurnRoles(prompt)).toEqual(["user", "model"]);
+    expect(prompt).toMatch(
+      /^<start_of_turn>user\nYou have access to the following tools:[\s\S]*\n\n---\n\nfirst\n\nsecond<end_of_turn>\n<start_of_turn>model\n$/
+    );
+    expect(prompt.split("You have access to the following tools:")).toHaveLength(2);
+  });
+
+  it("merges consecutive same-role turns in the generic template", () => {
+    const prompt = renderPrompt(
+      [
+        { role: "user", content: "what is in src?" },
+        { role: "assistant", content: "Let me check." },
+        {
+          role: "assistant",
+          content: "",
+          toolCalls: [{ id: "c1", name: "execute", args: { command: "ls src" } }]
+        },
+        { role: "tool", name: "execute", toolCallId: "c1", content: "index.ts" },
+        { role: "user", content: "thanks" }
+      ],
+      resolvePreset("some/other-model")
+    );
+    expect(prompt).toBe(
+      "user: what is in src?\n" +
+        "assistant: Let me check.\n\n```json\n" +
+        '{"name":"execute","arguments":{"command":"ls src"}}\n```\n' +
+        "user: [Tool Result for execute]: index.ts\n\nthanks\n" +
+        "assistant:"
+    );
   });
 });
 

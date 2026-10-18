@@ -12,8 +12,12 @@ export type GenerateFn = (
 
 /**
  * Renders the instruction block that teaches a local (non-tool-calling-API)
- * model how to invoke tools: the available tools, and the fenced JSON block
- * format `streamChat` scans the generation for.
+ * model how to invoke tools: the available tools, the fenced JSON block
+ * format `streamChat` scans the generation for, and when to use a tool at all.
+ *
+ * The no-tools-for-greetings rule must stay the final line: small models weigh
+ * the most recent instruction heaviest, and without it they answer "hi" with a
+ * tool call.
  */
 function renderToolInstructions(tools: ToolSchema[]): string {
   const lines: string[] = ["You have access to the following tools:"];
@@ -21,14 +25,6 @@ function renderToolInstructions(tools: ToolSchema[]): string {
     lines.push(`- ${tool.name}: ${tool.description}`);
     lines.push(`  parameters (JSON schema): ${JSON.stringify(tool.parameters)}`);
   }
-  lines.push("");
-  lines.push("Guidelines on when to use tools vs conversational replies:");
-  lines.push(
-    "- Conversational responses: For greetings (e.g. \"hi\", \"hello\", \"hey\", \"h\"), casual chat, questions, explanations, or general brainstorming, respond naturally in plain conversational text. Do NOT invoke any tools."
-  );
-  lines.push(
-    "- Action requests: When the user explicitly or implicitly asks you to perform an action (such as creating/editing files, running shell commands, exploring directories, or searching code), invoke the appropriate tool directly."
-  );
   lines.push("");
   lines.push("To invoke a tool, output a fenced JSON code block exactly like this:");
   lines.push("```json");
@@ -42,6 +38,20 @@ function renderToolInstructions(tools: ToolSchema[]): string {
     "Never tell the user to manually save or edit files when you can invoke a tool " +
       "directly — call the tool instead."
   );
+  lines.push("");
+  lines.push("Decide whether to use a tool by what the request needs:");
+  lines.push(
+    "- When answering requires inspecting files, creating or editing files, exploring " +
+      "directories, searching code, or executing shell commands, invoke the appropriate " +
+      "tool directly."
+  );
+  lines.push(
+    '- For greetings (e.g. "h", "hi", "hello", "hey"), casual chat, general questions, or ' +
+      "explanations that do not require workspace access, respond conversationally in " +
+      "plain text. Do NOT invoke any tools."
+  );
+  lines.push("");
+  lines.push("Do NOT invoke tools for casual greetings or general conversation.");
   return lines.join("\n");
 }
 
@@ -73,11 +83,38 @@ function turnRole(message: Message, template: "gemma" | "generic"): string {
   return message.role;
 }
 
+/** A rendered chat turn: the template's role label and the turn's text. */
+interface Turn {
+  role: string;
+  body: string;
+}
+
+/**
+ * Collapses each run of same-role turns into a single turn. Histories
+ * routinely contain such runs — several tool results in a row, a tool result
+ * followed by the next user prompt, or assistant text followed by a separate
+ * tool-call message — but Gemma is trained only on strictly alternating
+ * user/model turns and loses track of whose turn it is otherwise.
+ */
+function mergeConsecutiveTurns(turns: Turn[]): Turn[] {
+  const merged: Turn[] = [];
+  for (const turn of turns) {
+    const last = merged.at(-1);
+    if (last && last.role === turn.role) {
+      last.body = [last.body, turn.body].filter((body) => body.length > 0).join("\n\n");
+    } else {
+      merged.push({ ...turn });
+    }
+  }
+  return merged;
+}
+
 export function renderPrompt(
   messages: Message[],
   preset: ModelPreset,
   tools?: ToolSchema[]
 ): string {
+  const template = preset.chatTemplate;
   const toolInstructions =
     tools && tools.length > 0 ? renderToolInstructions(tools) : undefined;
   // A prompt must never open with a bare model turn: Gemma 3 degenerates into
@@ -88,43 +125,30 @@ export function renderPrompt(
       ? messages
       : [{ role: "user" as const, content: "" }];
 
-  if (preset.chatTemplate === "gemma") {
-    const parts: string[] = [];
-    let instructionsInjected = false;
-    for (const message of safe) {
-      const role = turnRole(message, "gemma");
-      let body = renderMessageBody(message);
-      // Prepend tool instructions to the first user turn so the conversation
-      // maintains strictly alternating turns instead of back-to-back user turns.
-      if (toolInstructions !== undefined && !instructionsInjected && role === "user") {
-        body = body.length > 0 ? `${toolInstructions}\n\n---\n\n${body}` : toolInstructions;
-        instructionsInjected = true;
-      }
-      parts.push(`<start_of_turn>${role}\n${body}<end_of_turn>\n`);
+  const turns = mergeConsecutiveTurns(
+    safe.map((message) => ({ role: turnRole(message, template), body: renderMessageBody(message) }))
+  );
+  // Tool instructions ride inside the first user turn rather than a turn of
+  // their own, which would otherwise sit back-to-back with that user turn.
+  if (toolInstructions !== undefined) {
+    const firstUser = turns.find((turn) => turn.role === "user");
+    if (firstUser) {
+      firstUser.body =
+        firstUser.body.length > 0
+          ? `${toolInstructions}\n\n---\n\n${firstUser.body}`
+          : toolInstructions;
+    } else {
+      turns.unshift({ role: "user", body: toolInstructions });
     }
-    // If there were no user turns to prepend to, insert as the initial user turn.
-    if (toolInstructions !== undefined && !instructionsInjected) {
-      parts.unshift(`<start_of_turn>user\n${toolInstructions}<end_of_turn>\n`);
-    }
-    parts.push("<start_of_turn>model\n");
-    return parts.join("");
   }
 
-  const lines: string[] = [];
-  let instructionsInjected = false;
-  for (const message of safe) {
-    const role = turnRole(message, "generic");
-    let body = renderMessageBody(message);
-    if (toolInstructions !== undefined && !instructionsInjected && role === "user") {
-      body = body.length > 0 ? `${toolInstructions}\n\n---\n\n${body}` : toolInstructions;
-      instructionsInjected = true;
-    }
-    lines.push(`${role}: ${body}`);
+  if (template === "gemma") {
+    return (
+      turns.map((turn) => `<start_of_turn>${turn.role}\n${turn.body}<end_of_turn>\n`).join("") +
+      "<start_of_turn>model\n"
+    );
   }
-  if (toolInstructions !== undefined && !instructionsInjected) {
-    lines.unshift(`user: ${toolInstructions}`);
-  }
-  return lines.join("\n") + "\nassistant:";
+  return turns.map((turn) => `${turn.role}: ${turn.body}`).join("\n") + "\nassistant:";
 }
 
 /** The fence marker the model is instructed to wrap tool invocations in. */
