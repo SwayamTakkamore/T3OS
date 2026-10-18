@@ -1,6 +1,9 @@
 import React from "react";
 import { describe, expect, it, vi } from "vitest";
 import { render } from "ink-testing-library";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { App } from "../src/App.js";
 import { emptyTranscript } from "../src/transcript.js";
 import type { DownloadProgress } from "@t3os/core";
@@ -889,6 +892,165 @@ describe("App", () => {
       expect(frame).not.toContain("Switch Provider to Local Mode");
     } finally {
       mockLocalModelStatus = null;
+    }
+  });
+
+  it("attaches a dropped file path, renders a chip, and injects contents on submit", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "t3os-drop-"));
+    const droppedFile = path.join(dir, "note.txt");
+    fs.writeFileSync(droppedFile, "hello from the dropped file");
+
+    try {
+      const state = emptyTranscript();
+      const onSubmit = vi.fn();
+      const { stdin, lastFrame } = render(
+        <App
+          state={state}
+          model="google/gemma-4-31B-it"
+          effort="high"
+          onSubmit={onSubmit}
+          onPermission={() => {}}
+        />,
+      );
+
+      await tick(100);
+
+      // Dropping the path attaches it instead of typing raw path text.
+      stdin.write(droppedFile);
+      await tick(50);
+
+      let frame = lastFrame();
+      expect(frame).toContain("📎 Attached:");
+      expect(frame).toContain("[📄 note.txt");
+      expect(frame).not.toContain(`❯ ${droppedFile}`);
+      expect(frame).toContain("[Drop File/Dir] Attach");
+
+      // The prompt itself still accepts normal typing alongside the chip.
+      stdin.write("explain this");
+      await tick(50);
+      expect(lastFrame()).toContain("explain this");
+
+      stdin.write(ENTER);
+      await tick(50);
+
+      expect(onSubmit).toHaveBeenCalledTimes(1);
+      const prompt = onSubmit.mock.calls[0]?.[0] as string;
+      expect(prompt).toContain("explain this");
+      expect(prompt).toContain("## Attached context");
+      expect(prompt).toContain("hello from the dropped file");
+      expect(prompt).toContain("note.txt");
+      // Both the chip and the input line are cleared after submitting.
+      expect(lastFrame()).not.toContain("[📄 note.txt");
+      expect(lastFrame()).not.toContain("explain this");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("submits a dropped file without prompt text using a default instruction", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "t3os-drop-"));
+    const droppedFile = path.join(dir, "lonely.txt");
+    fs.writeFileSync(droppedFile, "attachment only");
+
+    try {
+      const state = emptyTranscript();
+      const onSubmit = vi.fn();
+      const { stdin } = render(
+        <App
+          state={state}
+          model="google/gemma-4-31B-it"
+          effort="high"
+          onSubmit={onSubmit}
+          onPermission={() => {}}
+        />,
+      );
+
+      await tick(100);
+      stdin.write(droppedFile);
+      await tick(50);
+      stdin.write(ENTER);
+      await tick(50);
+
+      expect(onSubmit).toHaveBeenCalledTimes(1);
+      const prompt = onSubmit.mock.calls[0]?.[0] as string;
+      expect(prompt).toContain("Please inspect and explain the attached file(s)/directory.");
+      expect(prompt).toContain("attachment only");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("detaches the most recent attachment with Backspace when the input line is empty", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "t3os-drop-"));
+    const droppedFile = path.join(dir, "readme.md");
+    fs.writeFileSync(droppedFile, "# readme");
+
+    try {
+      const state = emptyTranscript();
+      const onSubmit = vi.fn();
+      const { stdin, lastFrame } = render(
+        <App
+          state={state}
+          model="google/gemma-4-31B-it"
+          effort="high"
+          onSubmit={onSubmit}
+          onPermission={() => {}}
+        />,
+      );
+
+      await tick(100);
+      stdin.write(droppedFile);
+      await tick(50);
+      expect(lastFrame()).toContain("[📄 readme.md");
+
+      stdin.write("\x7f"); // Backspace with an empty line detaches instead.
+      await tick(50);
+      expect(lastFrame()).not.toContain("[📄 readme.md");
+
+      // Nothing attached and no text: Enter must not submit.
+      stdin.write(ENTER);
+      await tick(50);
+      expect(onSubmit).not.toHaveBeenCalled();
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("attaches a dropped directory with an item count and clears it with Ctrl+U", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "t3os-drop-"));
+    fs.writeFileSync(path.join(dir, "a.txt"), "a");
+    fs.writeFileSync(path.join(dir, "b.txt"), "b");
+    const dirName = path.basename(dir);
+
+    try {
+      const state = emptyTranscript();
+      const onSubmit = vi.fn();
+      const { stdin, lastFrame } = render(
+        <App
+          state={state}
+          model="google/gemma-4-31B-it"
+          effort="high"
+          onSubmit={onSubmit}
+          onPermission={() => {}}
+        />,
+      );
+
+      await tick(100);
+      stdin.write(dir);
+      await tick(50);
+
+      let frame = lastFrame();
+      expect(frame).toContain(`[📁 ${dirName} (2 items)]`);
+
+      // Ctrl+U on an empty line detaches everything.
+      stdin.write("\x15");
+      await tick(50);
+
+      frame = lastFrame();
+      expect(frame).not.toContain("[📁 ");
+      expect(frame).toContain("Detached all attachments");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
     }
   });
 });

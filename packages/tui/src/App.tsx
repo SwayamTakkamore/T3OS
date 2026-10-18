@@ -16,6 +16,13 @@ import {
   type SessionBackup,
   type SessionMeta,
 } from "@t3os/core";
+import {
+  buildPromptWithAttachments,
+  createAttachment,
+  isPathDrop,
+  parseDroppedPaths,
+} from "./attachments.js";
+import type { AttachmentItem } from "./attachments.js";
 import type { SettingsUpdate } from "./settings.js";
 import type { TranscriptState } from "./transcript.js";
 
@@ -149,6 +156,8 @@ export function App({
   onRestoreBackup,
 }: AppProps): React.ReactElement {
   const [input, setInput] = useState("");
+  /** Files/directories dropped or pasted onto the prompt, shown as chips. */
+  const [attachments, setAttachments] = useState<AttachmentItem[]>([]);
   const [history, setHistory] = useState<string[]>([]);
   const [historyIndex, setHistoryIndex] = useState<number>(-1);
   const { exit } = useApp();
@@ -1200,8 +1209,14 @@ export function App({
       return;
     }
 
-    // Ctrl+U: Clear current prompt input line
+    // Ctrl+U: Clear current prompt input line (or detach everything when the
+    // line is already empty)
     if (key.ctrl && value === "u") {
+      if (input === "" && attachments.length > 0) {
+        setAttachments([]);
+        setStatusMessage("✖ Detached all attachments");
+        return;
+      }
       setInput("");
       setHistoryIndex(-1);
       return;
@@ -1247,26 +1262,47 @@ export function App({
       return;
     }
 
-    // Enter: Submit prompt
+    // Enter: Submit prompt (injecting any attached file/directory context)
     if (key.return) {
       const trimmed = input.trim();
-      if (trimmed.length > 0) {
-        setHistory((prev) => [...prev, trimmed]);
+      if (trimmed.length > 0 || attachments.length > 0) {
+        const prompt = buildPromptWithAttachments(trimmed, attachments);
+        if (trimmed.length > 0) {
+          setHistory((prev) => [...prev, trimmed]);
+        }
         setHistoryIndex(-1);
-        onSubmit(trimmed);
+        onSubmit(prompt);
       }
       setInput("");
+      setAttachments([]);
       return;
     }
 
-    // Backspace / Delete
+    // Backspace / Delete: with an empty line, detach the most recent attachment
     if (key.backspace || key.delete) {
+      if (input === "" && attachments.length > 0) {
+        const removed = attachments[attachments.length - 1];
+        setAttachments((prev) => prev.slice(0, -1));
+        setStatusMessage(`✖ Detached: ${removed?.name ?? "attachment"}`);
+        return;
+      }
       setInput((current) => current.slice(0, -1));
       return;
     }
 
-    // Regular typing
+    // Regular typing — or a drag-and-drop/paste of one or more paths, which
+    // become attachments instead of raw text in the input line.
     if (!key.ctrl && !key.meta && value && value.charCodeAt(0) >= 32) {
+      if (value.length > 1 && isPathDrop(value)) {
+        const items = parseDroppedPaths(value)
+          .map((droppedPath) => createAttachment(droppedPath))
+          .filter((item): item is AttachmentItem => item !== null);
+        if (items.length > 0) {
+          setAttachments((prev) => [...prev, ...items]);
+          setStatusMessage(`📎 Attached: ${items.map((item) => item.name).join(", ")}`);
+          return;
+        }
+      }
       setInput((current) => current + value);
     }
   });
@@ -1668,12 +1704,27 @@ export function App({
             ⚙ Working… please wait
           </Text>
         ) : (
-          <Box>
-            <Text bold color="green">
-              ❯{" "}
-            </Text>
-            <Text color="white">{input}</Text>
-            <Text color="gray">█</Text>
+          <Box flexDirection="column">
+            {attachments.length > 0 ? (
+              <Box>
+                <Text color="cyan">📎 Attached: </Text>
+                {attachments.map((attachment, idx) => (
+                  <Text key={`${attachment.path}-${idx}`} color="cyan">
+                    {idx > 0 ? " " : ""}
+                    {attachment.isDirectory
+                      ? `[📁 ${attachment.name} (${attachment.itemCount ?? 0} items)]`
+                      : `[📄 ${attachment.name} (${attachment.size ?? "?"})]`}
+                  </Text>
+                ))}
+              </Box>
+            ) : null}
+            <Box>
+              <Text bold color="green">
+                ❯{" "}
+              </Text>
+              <Text color="white">{input}</Text>
+              <Text color="gray">█</Text>
+            </Box>
           </Box>
         )}
       </Box>
@@ -1681,10 +1732,10 @@ export function App({
       {/* Footer keybinding helper */}
       <Box justifyContent="space-between" marginTop={1}>
         <Text dimColor>
-          [Ctrl+P] Settings   [Enter] Send   [↑/↓] History   [Ctrl+U] Clear Line   [Ctrl+L] Clear Screen
+          [Ctrl+P] Settings   [Enter] Send   [↑/↓] History   [Ctrl+U] Clear Line   [Drop File/Dir] Attach
         </Text>
         <Text dimColor>
-          [Ctrl+T] HF Token   [Ctrl+C] Exit
+          [Ctrl+L] Clear Screen   [Ctrl+T] HF Token   [Ctrl+C] Exit
         </Text>
       </Box>
     </Box>
