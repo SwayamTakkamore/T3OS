@@ -180,6 +180,12 @@ describe("startRepl turn", () => {
       });
 
       expect(seen[0]?.[0]).toEqual({ role: "user", content: "hello gemma" });
+
+      // Verify only one user message entry is rendered (no duplicate prompt)
+      const userEntries = harness.rendered.current!.props.state.entries.filter(
+        (e: any) => e.kind === "user",
+      );
+      expect(userEntries).toHaveLength(1);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

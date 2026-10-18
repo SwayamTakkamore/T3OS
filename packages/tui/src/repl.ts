@@ -314,7 +314,6 @@ export async function startRepl(options: ReplOptions): Promise<void> {
 
   async function turn(text: string): Promise<void> {
     busy = true;
-    state = reduceTranscript(state, { type: "user_message", text });
     draw();
     const result = await runTurn({
       provider: settings.provider(),
