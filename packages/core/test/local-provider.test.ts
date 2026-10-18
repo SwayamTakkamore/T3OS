@@ -137,6 +137,8 @@ describe("LocalProvider", () => {
       const snapshotDir = join(hubDir, "models--google--gemma-3-4b-it", "snapshots", "main");
       await mkdir(snapshotDir, { recursive: true });
       await writeFile(join(snapshotDir, "config.json"), "{}", "utf8");
+      // A usable cache must contain non-empty weight files, not just config.
+      await writeFile(join(snapshotDir, "decoder_model_merged.onnx"), Buffer.alloc(1024 * 1024, 1));
 
       let received: unknown;
       const provider = new LocalProvider({
@@ -232,8 +234,11 @@ describe("LocalProvider", () => {
       process.env.HOME = home;
       const hubDir = join(home, ".cache", "huggingface", "hub");
       const snapshotDir = join(hubDir, "models--onnx-community--gemma-3-4b-it-ONNX", "snapshots", "main");
-      await mkdir(snapshotDir, { recursive: true });
+      await mkdir(join(snapshotDir, "onnx"), { recursive: true });
       await writeFile(join(snapshotDir, "config.json"), "{}", "utf8");
+      // Non-empty ONNX weights are what makes the cache count as installed.
+      await writeFile(join(snapshotDir, "onnx", "embed_tokens.onnx"), Buffer.alloc(1024 * 1024, 1));
+      await writeFile(join(snapshotDir, "onnx", "decoder_model_merged.onnx"), Buffer.alloc(1024 * 1024, 1));
 
       let received: unknown;
       const provider = new LocalProvider({

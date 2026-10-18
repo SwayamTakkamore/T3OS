@@ -569,7 +569,8 @@ describe("App", () => {
     expect(frame).toContain("ONNX Model Repository");
     expect(frame).toContain("onnx-community/gemma-3-4b-it-ONNX");
     expect(frame).toContain("~2.4 GB");
-    expect(frame).toContain("✖ Not downloaded / Not installed");
+    expect(frame).toContain("Size on Disk");
+    expect(frame).toContain("✖ Not installed");
     expect(frame).toContain("Local cache path:");
     // The cache path is rendered on its own line as an absolute path.
     expect(frame).toMatch(/Local cache path:[^\n]*\n[^\n]*\//);

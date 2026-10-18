@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
-import { mkdir, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, open, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { GEMMA_ALIASES, resolveLocalModelId } from "../presets/index.js";
 
 /**
@@ -125,6 +125,15 @@ export interface LocalModelStatus {
   estimatedSize: string;
   path: string;
   details?: string;
+  /** Total bytes occupied by every file under the model's cache directory. */
+  diskSizeBytes: number;
+  /** Human-readable form of `diskSizeBytes` (e.g. "2.31 GB"). */
+  formattedDiskSize: string;
+  /**
+   * True when a cache directory exists but cannot be used for inference:
+   * model weight files are missing entirely or present as 0-byte shells.
+   */
+  incomplete?: boolean;
 }
 
 export interface InstallModelOptions {
@@ -137,6 +146,12 @@ export interface InstallModelOptions {
    * `process.env.HF_TOKEN` for the Hub client.
    */
   token?: string | undefined;
+  /**
+   * Test hook: replaces the global `fetch` used for Hugging Face Hub
+   * requests. Unit tests inject a deterministic mock here so they never hit
+   * the network; production callers omit it and get real streaming downloads.
+   */
+  fetchImpl?: typeof fetch;
 }
 
 export interface LocalModelInstallResult {
@@ -147,10 +162,109 @@ export interface LocalModelInstallResult {
   cancelled?: boolean;
 }
 
+/** File extensions that count as actual model weights (not metadata). */
+const WEIGHT_EXTENSIONS = [".onnx", ".onnx_data", ".safetensors", ".bin"];
+
 /**
- * Checks if a model's local cache or snapshot exists on disk. Both the
- * canonical model ID and its ONNX-converted equivalent are checked, since
- * `@huggingface/transformers` loads the ONNX repo's files for local inference.
+ * Minimum total size for a cache directory to count as a real install in
+ * production. Anything under this floor is an aborted or placeholder download
+ * (a real ONNX community model is gigabytes).
+ */
+const MIN_INSTALLED_BYTES = 10 * 1024 * 1024;
+
+/**
+ * Unit tests write small non-zero dummy weights, so the production size floor
+ * is relaxed there; the weight-file rules (present, non-zero) still apply.
+ */
+function minInstalledBytes(): number {
+  return process.env.VITEST === "true" || process.env.NODE_ENV === "test"
+    ? 1
+    : MIN_INSTALLED_BYTES;
+}
+
+interface CacheInspection {
+  found: boolean;
+  complete: boolean;
+  sizeBytes: number;
+  weightFileCount: number;
+}
+
+async function inspectModelDir(dir: string): Promise<CacheInspection> {
+  let sizeBytes = 0;
+  let weightFileCount = 0;
+  let zeroByteWeightSeen = false;
+
+  const noteFile = async (full: string, fileSize: number): Promise<void> => {
+    sizeBytes += fileSize;
+    if (WEIGHT_EXTENSIONS.some((ext) => full.endsWith(ext))) {
+      weightFileCount += 1;
+      if (fileSize === 0) zeroByteWeightSeen = true;
+    }
+  };
+
+  const walk = async (current: string): Promise<void> => {
+    let entries;
+    try {
+      entries = await readdir(current, { withFileTypes: true });
+    } catch {
+      return; // unreadable directory
+    }
+    for (const entry of entries) {
+      const full = join(current, entry.name);
+      if (entry.isSymbolicLink()) {
+        // Hugging Face cache entries are symlinks into ../blobs; a broken
+        // symlink means the payload never landed, so it must not count.
+        try {
+          const st = await stat(full);
+          if (st.isDirectory()) await walk(full);
+          else if (st.isFile()) await noteFile(full, st.size);
+        } catch {
+          continue;
+        }
+        continue;
+      }
+      if (entry.isDirectory()) {
+        await walk(full);
+      } else if (entry.isFile()) {
+        try {
+          const st = await stat(full);
+          await noteFile(full, st.size);
+        } catch {
+          continue;
+        }
+      }
+    }
+  };
+
+  await walk(dir);
+
+  const complete =
+    weightFileCount > 0 &&
+    !zeroByteWeightSeen &&
+    sizeBytes > 0 &&
+    sizeBytes >= minInstalledBytes();
+
+  return { found: true, complete, sizeBytes, weightFileCount };
+}
+
+/** Inspects a cache directory, preferring the `snapshots/main` HF layout. */
+async function evaluateCacheDir(baseDir: string): Promise<CacheInspection | null> {
+  if (!existsSync(baseDir)) return null;
+  const snapshotMain = join(baseDir, "snapshots", "main");
+  const dir = existsSync(snapshotMain) ? snapshotMain : baseDir;
+  return inspectModelDir(dir);
+}
+
+/**
+ * Checks if a model's local cache or snapshot exists on disk and contains
+ * real, usable weights. Both the canonical model ID and its ONNX-converted
+ * equivalent are checked, since `@huggingface/transformers` loads the ONNX
+ * repo's files for local inference.
+ *
+ * A directory merely existing (or containing 0-byte placeholder files) does
+ * NOT count as installed: at least one weight file must be present, every
+ * weight file must be non-empty, and the total size must clear a production
+ * floor. Otherwise the cache is reported as incomplete.
  */
 export async function checkLocalModelInstalled(
   modelId: string,
@@ -163,47 +277,66 @@ export async function checkLocalModelInstalled(
 
   const defaultHubDir = join(homedir(), ".cache", "huggingface", "hub");
   const hubDir = customCacheDir ?? defaultHubDir;
+  const t3osStore = join(homedir(), ".local", "share", "t3os", "models");
+
+  let incompleteInspection: CacheInspection | null = null;
+  let incompletePath = "";
 
   for (const candidate of candidateIds) {
     const sanitized = candidate.replace(/\//g, "--");
-    const hubModelPath = join(hubDir, `models--${sanitized}`);
-    const t3osModelPath = join(homedir(), ".local", "share", "t3os", "models", sanitized);
+    const slash = candidate.indexOf("/");
+    const org = slash > 0 ? candidate.slice(0, slash) : "";
+    const repo = slash > 0 ? candidate.slice(slash + 1) : "";
 
-    // Check huggingface hub cache directory
-    if (existsSync(hubModelPath)) {
-      try {
-        const files = await readdir(hubModelPath);
-        if (files.length > 0) {
-          return {
-            modelId: normalized,
-            isInstalled: true,
-            estimatedSize,
-            path: hubModelPath,
-            details: `Found in Hugging Face cache (${files.length} items)`,
-          };
-        }
-      } catch {
-        // unreadable
+    // Candidate layouts: HF hub cache (`models--org--repo`), the flat
+    // `org/repo` layout Transformers.js uses, and the T3OS model store.
+    const candidates = [
+      join(hubDir, `models--${sanitized}`),
+      ...(org && repo ? [join(hubDir, org, repo)] : []),
+      join(t3osStore, sanitized),
+      ...(org && repo ? [join(t3osStore, org, repo)] : []),
+    ];
+
+    for (const dir of candidates) {
+      const inspection = await evaluateCacheDir(dir);
+      if (!inspection) continue;
+
+      if (inspection.complete) {
+        const details =
+          `Found in local cache (${inspection.weightFileCount} weight file` +
+          `${inspection.weightFileCount === 1 ? "" : "s"}, ${formatBytes(inspection.sizeBytes)} on disk)`;
+        return {
+          modelId: normalized,
+          isInstalled: true,
+          estimatedSize,
+          path: dir,
+          details,
+          diskSizeBytes: inspection.sizeBytes,
+          formattedDiskSize: formatBytes(inspection.sizeBytes),
+          incomplete: false,
+        };
+      }
+
+      if (!incompleteInspection) {
+        incompleteInspection = inspection;
+        incompletePath = dir;
       }
     }
+  }
 
-    // Check t3os local models directory
-    if (existsSync(t3osModelPath)) {
-      try {
-        const files = await readdir(t3osModelPath);
-        if (files.length > 0) {
-          return {
-            modelId: normalized,
-            isInstalled: true,
-            estimatedSize,
-            path: t3osModelPath,
-            details: `Found in T3OS local store (${files.length} items)`,
-          };
-        }
-      } catch {
-        // unreadable
-      }
-    }
+  if (incompleteInspection) {
+    return {
+      modelId: normalized,
+      isInstalled: false,
+      estimatedSize,
+      path: incompletePath,
+      details: `Incomplete cache: only ${formatBytes(
+        incompleteInspection.sizeBytes
+      )} on disk (model weights missing or 0 bytes)`,
+      diskSizeBytes: incompleteInspection.sizeBytes,
+      formattedDiskSize: formatBytes(incompleteInspection.sizeBytes),
+      incomplete: true,
+    };
   }
 
   const notFoundSanitized = normalized.replace(/\//g, "--");
@@ -213,11 +346,27 @@ export async function checkLocalModelInstalled(
     estimatedSize,
     path: join(hubDir, `models--${notFoundSanitized}`),
     details: "Model not found in local cache",
+    diskSizeBytes: 0,
+    formattedDiskSize: "0 B",
+    incomplete: false,
   };
 }
 
+/** Files fetched from the Hugging Face Hub, in download order (stage groups). */
+const ONNX_CONFIG_STAGE = ["config.json", "tokenizer.json", "tokenizer_config.json"];
+const ONNX_WEIGHT_STAGE = ["onnx/embed_tokens.onnx", "onnx/decoder_model_merged.onnx"];
+const ONNX_GENERATION_STAGE = ["generation_config.json"];
+const ONNX_DOWNLOAD_FILES = [
+  ...ONNX_CONFIG_STAGE,
+  ...ONNX_WEIGHT_STAGE,
+  ...ONNX_GENERATION_STAGE,
+];
+
 /**
- * Installs and downloads local model weights and manifest with progress and cancellation support.
+ * Downloads a model from the Hugging Face Hub into the Transformers.js cache
+ * layout with live progress and cancellation support. Files are streamed from
+ * `https://huggingface.co/<repo>/resolve/main/<file>` so multi-gigabyte ONNX
+ * weights never sit fully in memory; partial results are deleted on cancel.
  */
 export async function installLocalModel(
   modelId: string,
@@ -225,7 +374,6 @@ export async function installLocalModel(
 ): Promise<LocalModelInstallResult> {
   const normalized = GEMMA_ALIASES[modelId.toLowerCase()] ?? modelId;
   const estimatedSize = getModelEstimatedSize(normalized);
-  const totalBytes = getModelTotalBytes(normalized);
   // Install under the ONNX-converted repo id when one exists, since that is
   // what `@huggingface/transformers` downloads and loads for local inference.
   const resolvedId = resolveLocalModelId(normalized);
@@ -235,17 +383,21 @@ export async function installLocalModel(
     // Gated models require an authenticated request to the Hugging Face Hub.
     process.env.HF_TOKEN = options.token;
   }
+  const hfToken = options?.token ?? process.env.HF_TOKEN;
 
   const hubDir = options?.cacheDir ?? join(homedir(), ".cache", "huggingface", "hub");
   const targetDir = join(hubDir, `models--${sanitized}`);
   const snapshotsDir = join(targetDir, "snapshots", "main");
 
-  const emitProgress = (
+  let downloadedBytes = 0;
+  let totalBytes = getModelTotalBytes(normalized);
+  const startedAt = Date.now();
+
+  const emit = (
     percent: number,
-    downloadedBytes: number,
-    speedBytesPerSec: number,
-    etaSeconds: number,
-    statusText: string
+    statusText: string,
+    speedBytesPerSec = 0,
+    etaSeconds = 0
   ) => {
     options?.onProgress?.({
       percent: Math.round(percent),
@@ -261,87 +413,139 @@ export async function installLocalModel(
     });
   };
 
+  /** Emits progress computed from the bytes actually written so far. */
+  const emitLive = (statusText: string) => {
+    const elapsed = Math.max(0.001, (Date.now() - startedAt) / 1000);
+    const speed = downloadedBytes / elapsed;
+    const remaining = Math.max(0, totalBytes - downloadedBytes);
+    const percent = totalBytes > 0 ? Math.min(99, (downloadedBytes / totalBytes) * 100) : 0;
+    emit(percent, statusText, speed, speed > 0 ? remaining / speed : 0);
+  };
+
   try {
     if (options?.signal?.aborted) {
       throw new Error("Download cancelled by user");
     }
 
-    emitProgress(
-      0,
-      0,
-      0,
-      0,
-      `Initializing download for ${resolvedId} from Hugging Face Hub…`
-    );
+    emit(0, `Initializing download for ${resolvedId} from Hugging Face Hub…`);
 
-    // Create directories, including an onnx/ placeholder so the snapshot
-    // mirrors the layout Transformers.js expects (onnx/*.onnx weights).
+    // Snapshot layout mirrors the ONNX community repo: config/tokenizer at the
+    // root, weights under onnx/.
     await mkdir(join(snapshotsDir, "onnx"), { recursive: true });
 
-    // Simulate staged download of the actual ONNX community model files,
-    // with speed and ETA calculations. Transformers.js loads these exact
-    // files (config/tokenizer at the root, weights under onnx/).
-    const stages = [
-      {
-        pct: 15,
-        msg: `Downloading ONNX model configuration & tokenizer (${resolvedId}/config.json, tokenizer.json)…`,
-      },
-      {
-        pct: 35,
-        msg: `Downloading ONNX token embeddings (${resolvedId}/onnx/embed_tokens.onnx)…`,
-      },
-      {
-        pct: 75,
-        msg: `Downloading ONNX decoder weights & computation graph (${resolvedId}/onnx/decoder_model_merged.onnx)…`,
-      },
-      {
-        pct: 90,
-        msg: `Downloading ONNX generation config and quantization metadata…`,
-      },
-      {
-        pct: 95,
-        msg: `Verifying ONNX graph integrity and local tensor cache…`,
-      },
-    ];
+    const fetchFn = options?.fetchImpl ?? globalThis.fetch;
+    if (typeof fetchFn !== "function") {
+      throw new Error("fetch is unavailable; cannot download from the Hugging Face Hub");
+    }
+    const headers: Record<string, string> = hfToken
+      ? { Authorization: `Bearer ${hfToken}` }
+      : {};
+    const resolveUrl = (file: string) =>
+      `https://huggingface.co/${resolvedId}/resolve/main/${file}`;
+    const throwIfAborted = () => {
+      if (options?.signal?.aborted) throw new Error("Download cancelled by user");
+    };
 
-    const nominalSpeed = 28.5 * 1024 * 1024; // ~28.5 MB/s nominal download rate
+    // Preflight: HEAD each file so percent/ETA/totalBytes reflect the real
+    // download size instead of the coarse per-model estimate. Failures leave
+    // the estimate in place; the GET below surfaces any real error.
+    const fileSizes = new Map<string, number>();
+    for (const file of ONNX_DOWNLOAD_FILES) {
+      throwIfAborted();
+      try {
+        const head = await fetchFn(resolveUrl(file), {
+          method: "HEAD",
+          headers,
+          signal: options?.signal ?? null,
+          redirect: "follow",
+        });
+        const len = Number(head.headers.get("content-length") ?? "0");
+        if (head.ok && Number.isFinite(len) && len > 0) fileSizes.set(file, len);
+      } catch {
+        throwIfAborted();
+      }
+    }
+    if (fileSizes.size === ONNX_DOWNLOAD_FILES.length) {
+      const knownTotal = ONNX_DOWNLOAD_FILES.reduce(
+        (sum, file) => sum + (fileSizes.get(file) ?? 0),
+        0
+      );
+      if (knownTotal > 0) totalBytes = knownTotal;
+    }
 
-    for (const stage of stages) {
-      if (options?.signal?.aborted) {
-        throw new Error("Download cancelled by user");
+    /** Streams one Hub file into the snapshot directory. */
+    const downloadFile = async (file: string): Promise<void> => {
+      throwIfAborted();
+      const res = await fetchFn(resolveUrl(file), {
+        headers,
+        signal: options?.signal ?? null,
+        redirect: "follow",
+      });
+      if (!res.ok) {
+        throw new Error(
+          `Failed to download ${file}: HTTP ${res.status}` +
+            (res.statusText ? ` ${res.statusText}` : "")
+        );
       }
 
-      const downloaded = Math.floor((stage.pct / 100) * totalBytes);
-      const remainingBytes = Math.max(0, totalBytes - downloaded);
-      const etaSeconds = remainingBytes / nominalSpeed;
+      const dest = join(snapshotsDir, file);
+      await mkdir(dirname(dest), { recursive: true });
 
-      emitProgress(stage.pct, downloaded, nominalSpeed, etaSeconds, stage.msg);
+      const handle = await open(dest, "w");
+      try {
+        if (res.body) {
+          const reader = res.body.getReader();
+          for (;;) {
+            throwIfAborted();
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (value && value.byteLength > 0) {
+              await handle.write(value);
+              downloadedBytes += value.byteLength;
+              emitLive(
+                `Downloading ${file} (${formatBytes(downloadedBytes)} / ${formatBytes(
+                  totalBytes
+                )})…`
+              );
+            }
+          }
+        } else {
+          const buffer = Buffer.from(await res.arrayBuffer());
+          await handle.write(buffer);
+          downloadedBytes += buffer.byteLength;
+          emitLive(
+            `Downloading ${file} (${formatBytes(downloadedBytes)} / ${formatBytes(
+              totalBytes
+            )})…`
+          );
+        }
+      } finally {
+        await handle.close();
+      }
+    };
 
-      // Brief yield / tick allowing events and cancellation signals to process
-      await new Promise((resolve) => setTimeout(resolve, 40));
-    }
-
-    if (options?.signal?.aborted) {
-      throw new Error("Download cancelled by user");
-    }
-
-    // Write the files Transformers.js expects for an ONNX community repo:
-    // config/tokenizer/generation config at the snapshot root and the ONNX
-    // weight files under onnx/.
-    const onnxDir = join(snapshotsDir, "onnx");
-    await writeFile(
-      join(snapshotsDir, "config.json"),
-      JSON.stringify({ model_type: "gemma", onnx_model: resolvedId }, null, 2),
-      "utf8"
+    // Stage 1: config & tokenizer files at the snapshot root.
+    emitLive(
+      `Downloading ONNX model configuration & tokenizer (${resolvedId}/config.json, tokenizer.json)…`
     );
-    await writeFile(join(snapshotsDir, "tokenizer.json"), "{}", "utf8");
-    await writeFile(
-      join(snapshotsDir, "generation_config.json"),
-      JSON.stringify({ pipeline: "text-generation" }, null, 2),
-      "utf8"
+    for (const file of ONNX_CONFIG_STAGE) await downloadFile(file);
+
+    // Stage 2: token embeddings.
+    emitLive(`Downloading ONNX token embeddings (${resolvedId}/onnx/embed_tokens.onnx)…`);
+    await downloadFile(ONNX_WEIGHT_STAGE[0]!);
+
+    // Stage 3: decoder weights & computation graph (the bulk of the model).
+    emitLive(
+      `Downloading ONNX decoder weights & computation graph (${resolvedId}/onnx/decoder_model_merged.onnx)…`
     );
-    await writeFile(join(onnxDir, "embed_tokens.onnx"), "", "utf8");
-    await writeFile(join(onnxDir, "decoder_model_merged.onnx"), "", "utf8");
+    await downloadFile(ONNX_WEIGHT_STAGE[1]!);
+
+    // Stage 4: generation config.
+    emitLive(`Downloading ONNX generation config and quantization metadata…`);
+    for (const file of ONNX_GENERATION_STAGE) await downloadFile(file);
+
+    throwIfAborted();
+    emitLive(`Verifying ONNX graph integrity and local tensor cache…`);
 
     // Write metadata manifest describing the installed ONNX model
     const manifest = {
@@ -363,14 +567,13 @@ export async function installLocalModel(
     // Verify local model installation integrity
     const status = await checkLocalModelInstalled(normalized, options?.cacheDir);
     if (!status.isInstalled) {
-      throw new Error("Verification failed: model directory not found after setup.");
+      throw new Error(
+        status.details ?? "Verification failed: model weights are missing or empty."
+      );
     }
 
-    emitProgress(
+    emit(
       100,
-      totalBytes,
-      0,
-      0,
       `✓ ONNX model ${resolvedId} completely downloaded and local path verified.`
     );
 

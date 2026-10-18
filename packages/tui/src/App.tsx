@@ -219,6 +219,10 @@ export function App({
     setCheckState({ model: target, loading: true, status: null, error: null });
     try {
       const status = await checkLocalModelInstalled(target);
+      // A directory that exists but lacks usable weights is "incomplete", not
+      // installed. Only the pure filesystem probe carries that nuance — when a
+      // host verdict overrides the probe, its verdict wins outright.
+      const fsIncomplete = !status.isInstalled && status.incomplete === true;
       const installed = onCheckModelInstalled
         ? await onCheckModelInstalled(target)
         : status.isInstalled;
@@ -229,11 +233,14 @@ export function App({
         status: {
           ...status,
           isInstalled: installed,
+          incomplete: onCheckModelInstalled ? false : fsIncomplete,
           details: installed
             ? status.isInstalled
               ? status.details ?? "Present in local cache"
               : "Verified in local cache"
-            : "Model not found in local cache",
+            : fsIncomplete && !onCheckModelInstalled
+              ? status.details ?? "Model not found in local cache"
+              : "Model not found in local cache",
         },
         error: null,
       });
@@ -604,7 +611,7 @@ export function App({
             void handleConfirmInstall(true);
           },
         });
-      } else if (activeProviderType === "hf") {
+      } else if (activeProviderType !== "local") {
         items.push({
           label: "Switch Provider to Local Mode",
           value: "currently Cloud",
@@ -956,6 +963,10 @@ export function App({
           <Text color="gray">Estimated Download Size</Text>
           <Text color="white">{getModelEstimatedSize(target)}</Text>
         </Box>
+        <Box justifyContent="space-between">
+          <Text color="gray">Size on Disk</Text>
+          <Text color="white">{state?.status?.formattedDiskSize ?? "0 B"}</Text>
+        </Box>
 
         {isDownloading ? (
           <Box flexDirection="column">
@@ -988,10 +999,12 @@ export function App({
           <Text color="red">✖ Check failed: {state.error}</Text>
         ) : state?.status?.isInstalled ? (
           <Text bold color="green">
-            ✓ Installed in local cache
+            ✓ Installed in local cache ({state.status.formattedDiskSize})
           </Text>
+        ) : state?.status?.incomplete ? (
+          <Text color="yellow">⚠ Incomplete (weights missing or 0 bytes)</Text>
         ) : state ? (
-          <Text color="red">✖ Not downloaded / Not installed</Text>
+          <Text color="red">✖ Not installed</Text>
         ) : null}
 
         {state?.status ? (
