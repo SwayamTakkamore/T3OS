@@ -3,8 +3,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { resolveLocalModelId, resolvePreset } from "../src/presets/index.js";
-import { LocalProvider, renderPrompt } from "../src/provider/local.js";
-import type { Delta } from "../src/types.js";
+import { GenerateFn, LocalProvider, renderPrompt } from "../src/provider/local.js";
+import type { Delta, ToolSchema } from "../src/types.js";
 
 const collect = async (iter: AsyncIterable<Delta>): Promise<Delta[]> => {
   const out: Delta[] = [];
@@ -47,9 +47,9 @@ describe("LocalProvider", () => {
     ]);
   });
 
-  it("reports no tool calling for a raw local generator", () => {
+  it("reports tool calling support (via fenced JSON tool blocks)", () => {
     const provider = new LocalProvider({ modelId: "google/gemma-2-2b-it", generate: fakeGenerate });
-    expect(provider.capabilities().toolCalling).toBe(false);
+    expect(provider.capabilities().toolCalling).toBe(true);
   });
 
   it("fails gracefully with helpful message when @huggingface/transformers is missing", async () => {
@@ -493,6 +493,207 @@ describe("LocalProvider", () => {
       { type: "text", text: " world" },
       { type: "done" }
     ]);
+  });
+
+  it("passes tools into the generation prompt", async () => {
+    let seenPrompt = "";
+    const generate: GenerateFn = async function* (prompt) {
+      seenPrompt = prompt;
+      yield "ok";
+    };
+    const provider = new LocalProvider({ modelId: "google/gemma-3-4b-it", generate });
+    await collect(
+      provider.streamChat([{ role: "user", content: "hi" }], [
+        { name: "read_file", description: "Read a file", parameters: { type: "object" } }
+      ])
+    );
+    expect(seenPrompt).toContain("read_file");
+    expect(seenPrompt).toContain("Read a file");
+    expect(seenPrompt).toContain("{ \"name\": \"<tool_name>\", \"arguments\": { ... } }");
+  });
+
+  it("detects a fenced JSON tool call and yields tool call deltas", async () => {
+    async function* toolCallGenerator() {
+      yield "Let me write that file.\n";
+      yield '```json\n{"name":"write_file","arguments":{"path":"a.ts","content":"x"}}\n```';
+    }
+    const provider = new LocalProvider({
+      modelId: "google/gemma-3-4b-it",
+      generate: toolCallGenerator
+    });
+    const tools: ToolSchema[] = [
+      { name: "write_file", description: "Write a file", parameters: { type: "object" } }
+    ];
+    const deltas = await collect(provider.streamChat([{ role: "user", content: "write a.ts" }], tools));
+
+    const start = deltas.find((d) => d.type === "tool_call_start");
+    expect(start).toMatchObject({ type: "tool_call_start", name: "write_file" });
+    const id = (start as Extract<Delta, { type: "tool_call_start" }>).id;
+    expect(deltas).toEqual([
+      { type: "text", text: "Let me write that file.\n" },
+      { type: "tool_call_start", id, name: "write_file" },
+      { type: "tool_call_delta", id, argsJsonDelta: '{"path":"a.ts","content":"x"}' },
+      { type: "tool_call_end", id },
+      { type: "done" }
+    ]);
+  });
+
+  it("handles a tool call split across streamed chunks", async () => {
+    async function* chunkedToolCall() {
+      yield "Calling ";
+      yield "```js";
+      yield 'on\n{"name":"re';
+      yield 'ad_file","arguments":{"path":"b.ts"}}\n';
+      yield "```";
+    }
+    const provider = new LocalProvider({
+      modelId: "google/gemma-3-4b-it",
+      generate: chunkedToolCall
+    });
+    const tools: ToolSchema[] = [
+      { name: "read_file", description: "Read a file", parameters: { type: "object" } }
+    ];
+    const deltas = await collect(provider.streamChat([{ role: "user", content: "read b.ts" }], tools));
+
+    const start = deltas.find((d) => d.type === "tool_call_start") as Extract<
+      Delta,
+      { type: "tool_call_start" }
+    >;
+    expect(start.name).toBe("read_file");
+    const argDelta = deltas.find((d) => d.type === "tool_call_delta") as Extract<
+      Delta,
+      { type: "tool_call_delta" }
+    >;
+    expect(JSON.parse(argDelta.argsJsonDelta)).toEqual({ path: "b.ts" });
+    expect(deltas.at(-1)).toEqual({ type: "done" });
+    // The text preceding the fence is preserved, the fence itself is not.
+    const text = deltas
+      .filter((d): d is Extract<Delta, { type: "text" }> => d.type === "text")
+      .map((d) => d.text)
+      .join("");
+    expect(text).toBe("Calling ");
+  });
+
+  it("emits a matching tool call when the fence is unterminated at stream end", async () => {
+    async function* unterminatedToolCall() {
+      yield '```json\n{"name":"read_file","arguments":{"path":"c.ts"}}';
+    }
+    const provider = new LocalProvider({
+      modelId: "google/gemma-3-4b-it",
+      generate: unterminatedToolCall
+    });
+    const tools: ToolSchema[] = [
+      { name: "read_file", description: "Read a file", parameters: { type: "object" } }
+    ];
+    const deltas = await collect(provider.streamChat([{ role: "user", content: "read c.ts" }], tools));
+    expect(deltas.filter((d) => d.type === "text")).toEqual([]);
+    const start = deltas.find((d) => d.type === "tool_call_start") as Extract<
+      Delta,
+      { type: "tool_call_start" }
+    >;
+    expect(start.name).toBe("read_file");
+    expect(deltas.at(-1)).toEqual({ type: "done" });
+  });
+
+  it("passes a fenced JSON block through as text when the tool is unknown", async () => {
+    async function* unknownToolCall() {
+      yield '```json\n{"name":"no_such_tool","arguments":{}}\n```';
+    }
+    const provider = new LocalProvider({
+      modelId: "google/gemma-3-4b-it",
+      generate: unknownToolCall
+    });
+    const tools: ToolSchema[] = [
+      { name: "read_file", description: "Read a file", parameters: { type: "object" } }
+    ];
+    const deltas = await collect(provider.streamChat([{ role: "user", content: "hi" }], tools));
+    expect(deltas.some((d) => d.type === "tool_call_start")).toBe(false);
+    const text = deltas
+      .filter((d): d is Extract<Delta, { type: "text" }> => d.type === "text")
+      .map((d) => d.text)
+      .join("");
+    expect(text).toContain('"name":"no_such_tool"');
+  });
+});
+
+describe("renderPrompt with tools", () => {
+  const tools: ToolSchema[] = [
+    {
+      name: "write_file",
+      description: "Write a file to disk",
+      parameters: { type: "object", properties: { path: { type: "string" } } }
+    },
+    {
+      name: "execute",
+      description: "Run a shell command",
+      parameters: { type: "object", properties: { command: { type: "string" } } }
+    }
+  ];
+
+  it("includes tool names, descriptions, and parameter schemas in the prompt", () => {
+    const preset = resolvePreset("google/gemma-3-4b-it");
+    const prompt = renderPrompt([{ role: "user", content: "create a file" }], preset, tools);
+    expect(prompt).toContain("write_file");
+    expect(prompt).toContain("Write a file to disk");
+    expect(prompt).toContain("execute");
+    expect(prompt).toContain("Run a shell command");
+    expect(prompt).toContain('{"type":"object","properties":{"path":{"type":"string"}}}');
+    expect(prompt).toContain('{ "name": "<tool_name>", "arguments": { ... } }');
+    expect(prompt).toContain("Never tell the user to manually save or edit files");
+    // Instructions land inside a user turn, ahead of the open model turn.
+    expect(prompt.indexOf("write_file")).toBeLessThan(prompt.indexOf("<start_of_turn>model"));
+  });
+
+  it("formats tool messages as user turns and prior tool calls inside the model turn", () => {
+    const preset = resolvePreset("google/gemma-3-4b-it");
+    const prompt = renderPrompt(
+      [
+        { role: "user", content: "write a.ts" },
+        {
+          role: "assistant",
+          content: "",
+          toolCalls: [{ id: "c1", name: "write_file", args: { path: "a.ts" } }]
+        },
+        { role: "tool", name: "write_file", toolCallId: "c1", content: "wrote a.ts" }
+      ],
+      preset,
+      tools
+    );
+    expect(prompt).toContain("<start_of_turn>user\n[Tool Result for write_file]: wrote a.ts<end_of_turn>");
+    // The assistant's previous invocation is re-rendered in the model turn.
+    const modelIdx = prompt.indexOf("<start_of_turn>model\n```json");
+    expect(modelIdx).toBeGreaterThan(-1);
+    expect(prompt).toContain('{"name":"write_file","arguments":{"path":"a.ts"}}');
+    expect(prompt.indexOf('[Tool Result for write_file]')).toBeGreaterThan(modelIdx);
+  });
+
+  it("formats tool results as user turns in the generic template", () => {
+    const preset = resolvePreset("some/other-model");
+    const prompt = renderPrompt(
+      [
+        { role: "user", content: "read b.ts" },
+        {
+          role: "assistant",
+          content: "",
+          toolCalls: [{ id: "c1", name: "execute", args: { command: "cat b.ts" } }]
+        },
+        { role: "tool", name: "execute", toolCallId: "c1", content: "contents of b.ts" }
+      ],
+      preset,
+      tools
+    );
+    expect(prompt).toContain("user: [Tool Result for execute]: contents of b.ts");
+    expect(prompt).toContain('{"name":"execute","arguments":{"command":"cat b.ts"}}');
+    expect(prompt.endsWith("\nassistant:")).toBe(true);
+  });
+
+  it("leaves the prompt unchanged when no tools are provided", () => {
+    const preset = resolvePreset("google/gemma-3-4b-it");
+    const withUndefined = renderPrompt([{ role: "user", content: "hi" }], preset);
+    const withEmpty = renderPrompt([{ role: "user", content: "hi" }], preset, []);
+    expect(withUndefined).toBe(withEmpty);
+    expect(withUndefined).not.toContain("<tool_name>");
+    expect(withUndefined).toBe("<start_of_turn>user\nhi<end_of_turn>\n<start_of_turn>model\n");
   });
 });
 

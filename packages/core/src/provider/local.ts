@@ -10,21 +10,240 @@ export type GenerateFn = (
   opts: { maxTokens: number; temperature: number; stopTokens: string[] }
 ) => AsyncIterable<string>;
 
-export function renderPrompt(messages: Message[], preset: ModelPreset): string {
+/**
+ * Renders the instruction block that teaches a local (non-tool-calling-API)
+ * model how to invoke tools: the available tools, and the fenced JSON block
+ * format `streamChat` scans the generation for.
+ */
+function renderToolInstructions(tools: ToolSchema[]): string {
+  const lines: string[] = ["You have access to the following tools:"];
+  for (const tool of tools) {
+    lines.push(`- ${tool.name}: ${tool.description}`);
+    lines.push(`  parameters (JSON schema): ${JSON.stringify(tool.parameters)}`);
+  }
+  lines.push("");
+  lines.push("To invoke a tool, output a fenced JSON code block exactly like this:");
+  lines.push("```json");
+  lines.push('{ "name": "<tool_name>", "arguments": { ... } }');
+  lines.push("```");
+  lines.push(
+    'Use the tool\'s name from the list above and "arguments" matching its parameters. ' +
+      "Invoke at most one tool per turn, then stop generating."
+  );
+  lines.push(
+    "Never tell the user to manually save or edit files when you can invoke a tool " +
+      "directly — call the tool instead."
+  );
+  return lines.join("\n");
+}
+
+/**
+ * Renders a single message's body. Tool results become `[Tool Result for
+ * <name>]: <output>` (rendered as a user turn by the caller), and an
+ * assistant turn that previously invoked tools re-renders those invocations
+ * in the same fenced JSON format the model is asked to produce.
+ */
+function renderMessageBody(message: Message): string {
+  if (message.role === "tool") {
+    const name = message.name ?? message.toolCallId ?? "tool";
+    return `[Tool Result for ${name}]: ${message.content}`;
+  }
+  if (message.role === "assistant" && message.toolCalls && message.toolCalls.length > 0) {
+    const blocks = message.toolCalls.map(
+      (call) => "```json\n" + JSON.stringify({ name: call.name, arguments: call.args }) + "\n```"
+    );
+    const parts = message.content ? [message.content, ...blocks] : blocks;
+    return parts.join("\n");
+  }
+  return message.content;
+}
+
+/** Maps a message role onto the role label the chat template expects. */
+function turnRole(message: Message, template: "gemma" | "generic"): string {
+  if (message.role === "tool") return "user";
+  if (message.role === "assistant" && template === "gemma") return "model";
+  return message.role;
+}
+
+export function renderPrompt(
+  messages: Message[],
+  preset: ModelPreset,
+  tools?: ToolSchema[]
+): string {
+  const toolInstructions =
+    tools && tools.length > 0 ? renderToolInstructions(tools) : undefined;
   // A prompt must never open with a bare model turn: Gemma 3 degenerates into
   // a repetition loop when it starts generating with zero user context, so an
   // empty history gets a placeholder user turn instead.
-  const safe = messages.length > 0 ? messages : [{ role: "user" as const, content: "" }];
+  const safe =
+    messages.length > 0 || toolInstructions !== undefined
+      ? messages
+      : [{ role: "user" as const, content: "" }];
   if (preset.chatTemplate === "gemma") {
     const parts: string[] = [];
+    if (toolInstructions !== undefined) {
+      parts.push(`<start_of_turn>user\n${toolInstructions}<end_of_turn>\n`);
+    }
     for (const message of safe) {
-      const role = message.role === "assistant" ? "model" : message.role;
-      parts.push(`<start_of_turn>${role}\n${message.content}<end_of_turn>\n`);
+      const role = turnRole(message, "gemma");
+      parts.push(`<start_of_turn>${role}\n${renderMessageBody(message)}<end_of_turn>\n`);
     }
     parts.push("<start_of_turn>model\n");
     return parts.join("");
   }
-  return safe.map((m) => `${m.role}: ${m.content}`).join("\n") + "\nassistant:";
+  const lines: string[] = [];
+  if (toolInstructions !== undefined) lines.push(`user: ${toolInstructions}`);
+  for (const message of safe) {
+    lines.push(`${turnRole(message, "generic")}: ${renderMessageBody(message)}`);
+  }
+  return lines.join("\n") + "\nassistant:";
+}
+
+/** The fence marker the model is instructed to wrap tool invocations in. */
+const TOOL_FENCE = "```json";
+
+let toolCallSeq = 0;
+
+function nextToolCallId(): string {
+  toolCallSeq += 1;
+  return `local-${Date.now().toString(36)}-${toolCallSeq}`;
+}
+
+/**
+ * Recognises a tool invocation inside a fenced JSON block. Returns undefined
+ * when the payload is not valid JSON, lacks `name`/`arguments`, or names a
+ * tool that is not in the provided schema list — such blocks are plain text.
+ */
+function parseToolCall(
+  jsonText: string,
+  tools: ToolSchema[]
+): { name: string; args: unknown } | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(jsonText.trim());
+  } catch {
+    return undefined;
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+  const record = parsed as Record<string, unknown>;
+  const name = record.name;
+  if (typeof name !== "string" || !tools.some((tool) => tool.name === name)) return undefined;
+  if (!("arguments" in record)) return undefined;
+  let args = record.arguments;
+  // Some models double-encode arguments as a JSON string; unwrap it.
+  if (typeof args === "string") {
+    try {
+      args = JSON.parse(args);
+    } catch {
+      // keep the raw string
+    }
+  }
+  return { name, args };
+}
+
+/**
+ * Length of the longest suffix of `buffer` that is a proper prefix of the
+ * fence marker — text that could still grow into a fence in the next chunk
+ * and therefore must not be flushed as text yet.
+ */
+function partialFencePrefixLength(buffer: string): number {
+  const max = Math.min(buffer.length, TOOL_FENCE.length - 1);
+  for (let len = max; len > 0; len--) {
+    if (buffer.endsWith(TOOL_FENCE.slice(0, len))) return len;
+  }
+  return 0;
+}
+
+/**
+ * Incrementally scans generated text for a fenced JSON tool invocation.
+ * Text before a matching block is flushed as `text` deltas; a matching block
+ * becomes `tool_call_start`/`tool_call_delta`/`tool_call_end`. Blocks that do
+ * not name an available tool pass through verbatim as text.
+ */
+class ToolCallScanner {
+  readonly #tools: ToolSchema[];
+  #buffer = "";
+  #inFence = false;
+  #resolved = false;
+
+  constructor(tools: ToolSchema[]) {
+    this.#tools = tools;
+  }
+
+  push(chunk: string): Delta[] {
+    if (this.#resolved) return chunk ? [{ type: "text", text: chunk }] : [];
+    this.#buffer += chunk;
+    const out: Delta[] = [];
+    for (;;) {
+      if (!this.#inFence) {
+        const start = this.#buffer.indexOf(TOOL_FENCE);
+        if (start === -1) {
+          // Hold back only text that could still become the start of a fence.
+          const hold = partialFencePrefixLength(this.#buffer);
+          const splitAt = this.#buffer.length - hold;
+          const emitText = splitAt > 0 ? this.#buffer.slice(0, splitAt) : "";
+          this.#buffer = hold > 0 ? this.#buffer.slice(splitAt) : "";
+          if (emitText) out.push({ type: "text", text: emitText });
+          return out;
+        }
+        const prefix = this.#buffer.slice(0, start);
+        if (prefix) out.push({ type: "text", text: prefix });
+        this.#buffer = this.#buffer.slice(start);
+        this.#inFence = true;
+        continue;
+      }
+      // Inside a fence: `buffer` starts with TOOL_FENCE.
+      const body = this.#buffer.slice(TOOL_FENCE.length);
+      const close = body.indexOf("```");
+      if (close === -1) return out; // wait for more of the block
+      const call = parseToolCall(body.slice(0, close), this.#tools);
+      if (call) {
+        const id = nextToolCallId();
+        out.push({ type: "tool_call_start", id, name: call.name });
+        out.push({
+          type: "tool_call_delta",
+          id,
+          argsJsonDelta: JSON.stringify(call.args ?? {})
+        });
+        out.push({ type: "tool_call_end", id });
+        this.#resolved = true;
+        const trailing = body.slice(close + 3);
+        this.#buffer = "";
+        this.#inFence = false;
+        if (trailing) out.push({ type: "text", text: trailing });
+        return out;
+      }
+      // Not a tool call — emit the fenced block verbatim and keep scanning.
+      out.push({ type: "text", text: TOOL_FENCE + body.slice(0, close + 3) });
+      this.#buffer = body.slice(close + 3);
+      this.#inFence = false;
+    }
+  }
+
+  flush(): Delta[] {
+    const out: Delta[] = [];
+    if (this.#inFence) {
+      // Unterminated fence at end of stream: accept it if it already parses
+      // as a valid tool invocation (generation can be cut short by a stop
+      // token), otherwise fall through and emit it as text.
+      const call = parseToolCall(this.#buffer.slice(TOOL_FENCE.length), this.#tools);
+      if (call) {
+        const id = nextToolCallId();
+        out.push({ type: "tool_call_start", id, name: call.name });
+        out.push({
+          type: "tool_call_delta",
+          id,
+          argsJsonDelta: JSON.stringify(call.args ?? {})
+        });
+        out.push({ type: "tool_call_end", id });
+        this.#resolved = true;
+      }
+    }
+    if (!this.#resolved && this.#buffer) out.push({ type: "text", text: this.#buffer });
+    this.#buffer = "";
+    this.#inFence = false;
+    return out;
+  }
 }
 
 interface StreamerLike {
@@ -380,7 +599,10 @@ export class LocalProvider implements Provider {
   }
 
   capabilities(): ProviderCapabilities {
-    return { toolCalling: false, streaming: true, contextLength: this.#contextLength };
+    // Local models have no native tool-calling API, but the prompt template
+    // teaches them to emit fenced JSON tool invocations which streamChat
+    // parses into tool call deltas — so tool calling is supported end to end.
+    return { toolCalling: true, streaming: true, contextLength: this.#contextLength };
   }
 
   async #load(): Promise<GenerateFn> {
@@ -396,20 +618,29 @@ export class LocalProvider implements Provider {
 
   async *streamChat(
     messages: Message[],
-    _tools: ToolSchema[],
+    tools: ToolSchema[],
     opts?: StreamOptions
   ): AsyncIterable<Delta> {
     const generate = await this.#load();
-    const prompt = renderPrompt(messages, this.#preset);
+    const prompt = renderPrompt(messages, this.#preset, tools);
     const iterator = generate(prompt, {
       maxTokens: opts?.maxTokens ?? this.#preset.maxTokens,
       temperature: opts?.temperature ?? this.#preset.temperature,
       stopTokens: this.#preset.stopTokens
     });
+    // Without tools nothing can match a tool invocation, so text streams
+    // straight through untouched.
+    const scanner = tools.length > 0 ? new ToolCallScanner(tools) : undefined;
     for await (const text of iterator) {
       if (opts?.signal?.aborted) throw new Error("aborted");
-      if (text.length > 0) yield { type: "text", text };
+      if (text.length === 0) continue;
+      if (!scanner) {
+        yield { type: "text", text };
+        continue;
+      }
+      yield* scanner.push(text);
     }
+    if (scanner) yield* scanner.flush();
     yield { type: "done" };
   }
 }
