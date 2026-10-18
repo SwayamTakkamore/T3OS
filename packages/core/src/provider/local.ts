@@ -11,9 +11,33 @@ export type GenerateFn = (
 ) => AsyncIterable<string>;
 
 /**
+ * Worked tool invocations for the few-shot action example, in preference
+ * order. Only an example whose tool is actually available may be shown — an
+ * example naming a missing tool teaches the model to call it.
+ */
+const ACTION_EXAMPLES: ReadonlyArray<{ name: string; request: string; args: unknown }> = [
+  {
+    name: "write_file",
+    request: "create index.html with a hello world page",
+    args: { path: "index.html", content: "<h1>Hello, world!</h1>" }
+  },
+  { name: "list_dir", request: "list the files in this folder", args: { path: "." } },
+  { name: "read_file", request: "show me package.json", args: { path: "package.json" } },
+  { name: "run_shell", request: "run the tests", args: { command: "npm test" } }
+];
+
+function actionExample(tools: ToolSchema[]): { name: string; request: string; args: unknown } {
+  const known = ACTION_EXAMPLES.find((example) => tools.some((tool) => tool.name === example.name));
+  if (known) return known;
+  const [first] = tools;
+  return { name: first?.name ?? "<tool_name>", request: first?.description ?? "", args: {} };
+}
+
+/**
  * Renders the instruction block that teaches a local (non-tool-calling-API)
  * model how to invoke tools: the available tools, the fenced JSON block
- * format `streamChat` scans the generation for, and when to use a tool at all.
+ * format `streamChat` scans the generation for, when to use a tool at all,
+ * and a greeting/action pair of concrete examples of that choice.
  *
  * The no-tools-for-greetings rule must stay the final line: small models weigh
  * the most recent instruction heaviest, and without it they answer "hi" with a
@@ -50,6 +74,15 @@ function renderToolInstructions(tools: ToolSchema[]): string {
       "explanations that do not require workspace access, respond conversationally in " +
       "plain text. Do NOT invoke any tools."
   );
+  lines.push("");
+  const example = actionExample(tools);
+  lines.push("Examples:");
+  lines.push('- The user says "hi". Reply in plain text, with no tool call:');
+  lines.push("  Hi! How can I help you today?");
+  lines.push(`- The user says "${example.request}". Reply with only the tool call:`);
+  lines.push("```json");
+  lines.push(JSON.stringify({ name: example.name, arguments: example.args }));
+  lines.push("```");
   lines.push("");
   lines.push("Do NOT invoke tools for casual greetings or general conversation.");
   return lines.join("\n");
@@ -149,6 +182,93 @@ export function renderPrompt(
     );
   }
   return turns.map((turn) => `${turn.role}: ${turn.body}`).join("\n") + "\nassistant:";
+}
+
+/**
+ * Words that mark a message as asking for workspace work: action verbs and
+ * shell commands, plus nouns naming workspace things a reply would have to
+ * inspect. Matched against simple inflections too ("creating", "files").
+ */
+const ACTION_WORDS = new Set([
+  "create", "make", "build", "write", "edit", "modify", "update", "change", "fix", "patch",
+  "delete", "remove", "rename", "move", "copy", "add", "append", "insert", "replace",
+  "refactor", "implement", "scaffold", "generate", "save", "run", "execute", "install",
+  "uninstall", "compile", "test", "lint", "format", "debug", "deploy", "list", "read", "open",
+  "show", "print", "check", "find", "search", "inspect", "view", "explore", "scan", "analyze",
+  "analyse", "review", "summarize", "summarise", "diff", "commit", "push", "pull", "clone",
+  "download", "fetch", "init", "setup",
+  "ls", "cat", "rm", "mv", "cp", "mkdir", "touch", "cd", "pwd", "grep", "glob", "exec", "git",
+  "npm", "pnpm", "yarn", "npx", "pip", "cargo",
+  "file", "folder", "directory", "dir", "repo", "repository", "project", "codebase",
+  "workspace", "code", "script", "readme", "makefile", "dockerfile", "terminal", "shell",
+  "command"
+]);
+
+/** Base forms a token may be an inflection of: "creating" → "create", "copied" → "copy". */
+function wordStems(token: string): string[] {
+  const stems = [token];
+  for (const suffix of ["ing", "ied", "ies", "ed", "es", "s", "d"]) {
+    if (token.length <= suffix.length + 1 || !token.endsWith(suffix)) continue;
+    const stem = token.slice(0, -suffix.length);
+    stems.push(stem, `${stem}e`);
+    if (suffix.startsWith("i")) stems.push(`${stem}y`);
+    if (stem.length > 2 && stem.at(-1) === stem.at(-2)) stems.push(stem.slice(0, -1));
+  }
+  return stems;
+}
+
+const FILE_EXTENSION_PATTERN =
+  /(?:^|[^\w])[\w-]*\.(?:html?|css|s[ac]ss|less|[cm]?jsx?|tsx?|json|mdx?|txt|py|rs|go|java|kt|swift|c|h|cpp|hpp|cs|rb|php|sh|bash|zsh|ya?ml|toml|ini|cfg|conf|env|lock|xml|svg|png|jpe?g|gif|sql|csv|log|vue|svelte|lua|dart|gitignore)\b/i;
+
+/** Path separators, file names, or inline code — references to the workspace. */
+function hasPathSyntax(text: string): boolean {
+  return /[\w.~-]*[/\\][\w.-]/.test(text) || FILE_EXTENSION_PATTERN.test(text) || /`[^`]+`/.test(text);
+}
+
+/** Greetings, thanks, farewells, and reactions, tolerating elongation ("hiii", "heyyy"). */
+const CONVERSATIONAL_TOKEN_PATTERN =
+  /^(?:h+|h+i+|he+y+a*|hel+o+|hiy+a+|yo+|sup|howdy|hola|greetings|gm|gn|morning|evening|afternoon|th[ae]nks*|thank|thankyou|thx|ty|tysm|cheers|bye+|goodbye|cya|lol|lmao|ha(?:ha)+|he(?:he)+|cool|nice|wow|awesome|great|amazing|sweet)$/;
+
+const CONVERSATIONAL_PHRASES = [
+  "how are you", "how are u", "how r you", "how r u", "how's it going", "hows it going",
+  "how is it going", "how do you do", "what's up", "whats up", "wassup", "who are you",
+  "what are you", "what's your name", "whats your name", "nice to meet you", "good job",
+  "well done", "see you", "good night"
+];
+
+/**
+ * Decides whether a turn should be offered tools at all. Small local models
+ * are strongly attracted to tool schemas in the prompt: a 4B model answers
+ * "hi" with an `edit_file` call despite instructions not to. So a latest user
+ * message that is recognisably conversational and shows no sign of wanting
+ * workspace work gets no tools. Anything unrecognised keeps them, and so does
+ * a turn in the middle of a tool loop.
+ */
+export function shouldProvideTools(messages: Message[], tools: ToolSchema[]): boolean {
+  if (tools.length === 0) return false;
+  const last = messages.at(-1);
+  if (last?.role === "tool") return true;
+  if (last?.role === "assistant" && (last.toolCalls?.length ?? 0) > 0) return true;
+
+  let latestUser: Message | undefined;
+  for (let i = messages.length - 1; i >= 0 && !latestUser; i--) {
+    if (messages[i]?.role === "user") latestUser = messages[i];
+  }
+  if (!latestUser) return true;
+  const text = latestUser.content.toLowerCase().replace(/[\u2018\u2019]/g, "'");
+  if (hasPathSyntax(text)) return true;
+
+  const tokens = text
+    .split(/[^a-z0-9']+/)
+    .map((token) => token.replace(/^'+|'+$/g, ""))
+    .filter((token) => token.length > 0);
+  if (tokens.some((token) => wordStems(token).some((stem) => ACTION_WORDS.has(stem)))) return true;
+
+  const phrase = ` ${tokens.join(" ")} `;
+  const conversational =
+    tokens.some((token) => CONVERSATIONAL_TOKEN_PATTERN.test(token)) ||
+    CONVERSATIONAL_PHRASES.some((candidate) => phrase.includes(` ${candidate} `));
+  return !conversational;
 }
 
 /** The fence marker the model is instructed to wrap tool invocations in. */
@@ -674,7 +794,8 @@ export class LocalProvider implements Provider {
     opts?: StreamOptions
   ): AsyncIterable<Delta> {
     const generate = await this.#load();
-    const prompt = renderPrompt(messages, this.#preset, tools);
+    const effectiveTools = shouldProvideTools(messages, tools) ? tools : [];
+    const prompt = renderPrompt(messages, this.#preset, effectiveTools);
     const iterator = generate(prompt, {
       maxTokens: opts?.maxTokens ?? this.#preset.maxTokens,
       temperature: opts?.temperature ?? this.#preset.temperature,
@@ -682,7 +803,7 @@ export class LocalProvider implements Provider {
     });
     // Without tools nothing can match a tool invocation, so text streams
     // straight through untouched.
-    const scanner = tools.length > 0 ? new ToolCallScanner(tools) : undefined;
+    const scanner = effectiveTools.length > 0 ? new ToolCallScanner(effectiveTools) : undefined;
     for await (const text of iterator) {
       if (opts?.signal?.aborted) throw new Error("aborted");
       if (text.length === 0) continue;

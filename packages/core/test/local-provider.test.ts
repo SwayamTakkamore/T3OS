@@ -3,8 +3,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { resolveLocalModelId, resolvePreset } from "../src/presets/index.js";
-import { GenerateFn, LocalProvider, renderPrompt } from "../src/provider/local.js";
-import type { Delta, ToolSchema } from "../src/types.js";
+import {
+  GenerateFn,
+  LocalProvider,
+  renderPrompt,
+  shouldProvideTools
+} from "../src/provider/local.js";
+import type { Delta, Message, ToolSchema } from "../src/types.js";
 
 const collect = async (iter: AsyncIterable<Delta>): Promise<Delta[]> => {
   const out: Delta[] = [];
@@ -507,7 +512,7 @@ describe("LocalProvider", () => {
     };
     const provider = new LocalProvider({ modelId: "google/gemma-3-4b-it", generate });
     await collect(
-      provider.streamChat([{ role: "user", content: "hi" }], [
+      provider.streamChat([{ role: "user", content: "read a.ts" }], [
         { name: "read_file", description: "Read a file", parameters: { type: "object" } }
       ])
     );
@@ -610,13 +615,141 @@ describe("LocalProvider", () => {
     const tools: ToolSchema[] = [
       { name: "read_file", description: "Read a file", parameters: { type: "object" } }
     ];
-    const deltas = await collect(provider.streamChat([{ role: "user", content: "hi" }], tools));
+    const deltas = await collect(provider.streamChat([{ role: "user", content: "read a.ts" }], tools));
     expect(deltas.some((d) => d.type === "tool_call_start")).toBe(false);
     const text = deltas
       .filter((d): d is Extract<Delta, { type: "text" }> => d.type === "text")
       .map((d) => d.text)
       .join("");
     expect(text).toContain('"name":"no_such_tool"');
+  });
+
+  it("withholds tool schemas and tool-call parsing for a greeting", async () => {
+    let seenPrompt = "";
+    // A tool-attracted model answering a greeting with an edit_file call.
+    const generate: GenerateFn = async function* (prompt) {
+      seenPrompt = prompt;
+      yield '```json\n{"name":"edit_file","arguments":{"path":"a.ts","oldString":"a","newString":"b"}}\n```';
+    };
+    const provider = new LocalProvider({ modelId: "google/gemma-3-4b-it", generate });
+    const tools: ToolSchema[] = [
+      { name: "edit_file", description: "Edit a file", parameters: { type: "object" } }
+    ];
+    const deltas = await collect(
+      provider.streamChat([{ role: "user", content: "hi cutieeee" }], tools)
+    );
+
+    expect(seenPrompt).toBe("<start_of_turn>user\nhi cutieeee<end_of_turn>\n<start_of_turn>model\n");
+    expect(seenPrompt).not.toContain("You have access to the following tools");
+    expect(deltas.some((d) => d.type.startsWith("tool_call"))).toBe(false);
+    const text = deltas
+      .filter((d): d is Extract<Delta, { type: "text" }> => d.type === "text")
+      .map((d) => d.text)
+      .join("");
+    expect(text).toContain('"name":"edit_file"');
+    expect(deltas.at(-1)).toEqual({ type: "done" });
+  });
+
+  it("keeps tools available mid tool loop even when the user opened with a greeting", async () => {
+    let seenPrompt = "";
+    const generate: GenerateFn = async function* (prompt) {
+      seenPrompt = prompt;
+      yield '```json\n{"name":"read_file","arguments":{"path":"a.ts"}}\n```';
+    };
+    const provider = new LocalProvider({ modelId: "google/gemma-3-4b-it", generate });
+    const tools: ToolSchema[] = [
+      { name: "list_dir", description: "List a directory", parameters: { type: "object" } },
+      { name: "read_file", description: "Read a file", parameters: { type: "object" } }
+    ];
+    const messages: Message[] = [
+      { role: "user", content: "hey" },
+      { role: "assistant", content: "", toolCalls: [{ id: "c1", name: "list_dir", args: {} }] },
+      { role: "tool", name: "list_dir", toolCallId: "c1", content: "a.ts" }
+    ];
+    const deltas = await collect(provider.streamChat(messages, tools));
+
+    expect(seenPrompt).toContain("You have access to the following tools");
+    expect(deltas.find((d) => d.type === "tool_call_start")).toMatchObject({ name: "read_file" });
+  });
+});
+
+describe("shouldProvideTools", () => {
+  const tools: ToolSchema[] = [
+    { name: "edit_file", description: "Edit a file", parameters: { type: "object" } }
+  ];
+  const user = (content: string): Message[] => [{ role: "user", content }];
+
+  it.each(["h", "hi", "hello", "hey", "hi cutieeee", "how are you", "thanks", "I'm saying... hi"])(
+    "withholds tools for the conversational message %j",
+    (content) => {
+      expect(shouldProvideTools(user(content), tools)).toBe(false);
+    }
+  );
+
+  it.each([
+    "create index.html",
+    "ls",
+    "run tests",
+    "in this folder.. create a single page website",
+    "hi, list the files"
+  ])("provides tools for the action request %j", (content) => {
+    expect(shouldProvideTools(user(content), tools)).toBe(true);
+  });
+
+  it.each(["hey, what's in src/index.ts?", "hello! `useEffect` seems wrong", "hiii, package.json?"])(
+    "treats file and path syntax as an action request: %j",
+    (content) => {
+      expect(shouldProvideTools(user(content), tools)).toBe(true);
+    }
+  );
+
+  it("provides tools while tool results are in progress", () => {
+    const messages: Message[] = [
+      { role: "user", content: "hi" },
+      { role: "assistant", content: "", toolCalls: [{ id: "c1", name: "edit_file", args: {} }] },
+      { role: "tool", name: "edit_file", toolCallId: "c1", content: "edited a.ts" }
+    ];
+    expect(shouldProvideTools(messages, tools)).toBe(true);
+  });
+
+  it("provides tools when the last message is an assistant tool call", () => {
+    const messages: Message[] = [
+      { role: "user", content: "hello" },
+      { role: "assistant", content: "", toolCalls: [{ id: "c1", name: "edit_file", args: {} }] }
+    ];
+    expect(shouldProvideTools(messages, tools)).toBe(true);
+  });
+
+  it("judges the latest user message rather than earlier ones", () => {
+    expect(
+      shouldProvideTools(
+        [
+          { role: "user", content: "create a.ts" },
+          { role: "assistant", content: "Created a.ts." },
+          { role: "user", content: "thanks" }
+        ],
+        tools
+      )
+    ).toBe(false);
+    expect(
+      shouldProvideTools(
+        [
+          { role: "user", content: "hi" },
+          { role: "assistant", content: "Hello!" },
+          { role: "user", content: "now create a landing page" }
+        ],
+        tools
+      )
+    ).toBe(true);
+  });
+
+  it("keeps tools for messages it cannot classify as conversational", () => {
+    expect(shouldProvideTools(user("yes please"), tools)).toBe(true);
+    expect(shouldProvideTools([], tools)).toBe(true);
+  });
+
+  it("provides nothing when no tools are available", () => {
+    expect(shouldProvideTools(user("create index.html"), [])).toBe(false);
   });
 });
 
@@ -713,6 +846,40 @@ describe("renderPrompt with tools", () => {
     expect(format).toBeGreaterThan(-1);
     expect(format).toBeLessThan(toolBullet);
     expect(toolBullet).toBeLessThan(greetingBullet);
+  });
+
+  it("gives a greeting example in text and an action example as a tool call", () => {
+    const prompt = renderPrompt([{ role: "user", content: "h" }], resolvePreset("google/gemma-3-4b-it"), tools);
+    const greetingExample =
+      '- The user says "hi". Reply in plain text, with no tool call:\n  Hi! How can I help you today?';
+    const actionExample =
+      '- The user says "create index.html with a hello world page". Reply with only the tool call:\n' +
+      "```json\n" +
+      '{"name":"write_file","arguments":{"path":"index.html","content":"<h1>Hello, world!</h1>"}}\n' +
+      "```";
+    expect(prompt).toContain(`Examples:\n${greetingExample}\n${actionExample}\n`);
+    // The examples follow the decision guidance and precede the final rule.
+    const examples = prompt.indexOf("Examples:");
+    expect(prompt.indexOf('- For greetings (e.g. "h"')).toBeLessThan(examples);
+    expect(examples).toBeLessThan(
+      prompt.indexOf("Do NOT invoke tools for casual greetings or general conversation.")
+    );
+  });
+
+  it("only uses available tools in the action example", () => {
+    const preset = resolvePreset("google/gemma-3-4b-it");
+    const listOnly = renderPrompt([{ role: "user", content: "h" }], preset, [
+      { name: "list_dir", description: "List a directory", parameters: { type: "object" } }
+    ]);
+    expect(listOnly).toContain('- The user says "list the files in this folder".');
+    expect(listOnly).toContain('{"name":"list_dir","arguments":{"path":"."}}');
+    expect(listOnly).not.toContain("write_file");
+
+    const unknownOnly = renderPrompt([{ role: "user", content: "h" }], preset, [
+      { name: "execute", description: "Run a shell command", parameters: { type: "object" } }
+    ]);
+    expect(unknownOnly).toContain('- The user says "Run a shell command".');
+    expect(unknownOnly).toContain('{"name":"execute","arguments":{}}');
   });
 
   it("ends the instruction block with the no-tools-for-greetings rule", () => {
