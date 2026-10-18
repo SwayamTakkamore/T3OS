@@ -1053,4 +1053,33 @@ describe("App", () => {
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it("pressing Esc when busy calls onCancel and shows [Esc] Cancel", async () => {
+    const state = emptyTranscript();
+    const onCancel = vi.fn();
+    const onSubmit = vi.fn(() => {
+      // Stay busy - never resolve
+    });
+    const { stdin, lastFrame } = render(
+      <App
+        state={state}
+        model="google/gemma-4-31B-it"
+        effort="high"
+        onSubmit={onSubmit}
+        onPermission={() => {}}
+        busy
+        onCancel={onCancel}
+      />,
+    );
+
+    await tick(100);
+    const frame = lastFrame();
+    expect(frame).toContain("⚙ Working… please wait");
+    expect(frame).toContain("[Esc] Cancel");
+
+    stdin.write(ESC);
+    await tick(50);
+    expect(onCancel).toHaveBeenCalled();
+    expect(lastFrame()).toContain("✖ Request cancelled");
+  });
 });

@@ -72,6 +72,7 @@ export interface AppProps {
   busy?: boolean;
   permission?: PendingPermission | null;
   onPermission: (outcome: ApprovalOutcome) => void;
+  onCancel?: () => void;
   onOpenToken?: () => void;
   onClear?: () => void;
   /**
@@ -137,6 +138,7 @@ export function App({
   busy = false,
   permission = null,
   onPermission,
+  onCancel,
   onOpenToken,
   onClear,
   onChangeModel,
@@ -1049,6 +1051,16 @@ export function App({
       return;
     }
 
+    // When busy, Esc cancels the in-flight request
+    if (busy) {
+      if (key.escape) {
+        onCancel?.();
+        setStatusMessage("✖ Request cancelled");
+        return;
+      }
+      return;
+    }
+
     // Handle Local Model Dialog Prompts (Confirmation -> Not Installed Check -> Install Prompt -> Downloading -> Confirm Cancel)
     if (localDialogStep !== "none") {
       if (localDialogStep === "downloading") {
@@ -1230,14 +1242,17 @@ export function App({
 
     // Handle interactive permission prompts
     if (permission) {
+      if (key.escape) {
+        onPermission("deny");
+        onCancel?.();
+        return;
+      }
       if (value === "y") onPermission("allow");
       else if (value === "a") onPermission("always");
       else if (value === "d") onPermission("session");
       else if (value === "n") onPermission("deny");
       return;
     }
-
-    if (busy) return;
 
     // Up arrow: Navigate command history backwards
     if (key.upArrow) {
@@ -1700,9 +1715,10 @@ export function App({
             ⚡ Settings Menu active — use [↑/↓] to navigate, [Enter] to choose
           </Text>
         ) : busy ? (
-          <Text color="yellow">
-            ⚙ Working… please wait
-          </Text>
+          <Box justifyContent="space-between">
+            <Text color="yellow">⚙ Working… please wait</Text>
+            <Text color="red">[Esc] Cancel</Text>
+          </Box>
         ) : (
           <Box flexDirection="column">
             {attachments.length > 0 ? (

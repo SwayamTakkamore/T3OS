@@ -101,6 +101,7 @@ export async function startRepl(options: ReplOptions): Promise<void> {
   let busy = false;
   let pending: PendingPermission | null = null;
   let resolvePermission: ((outcome: ApprovalOutcome) => void) | null = null;
+  let currentAbortController: AbortController | null = null;
 
   // The active session can change while the REPL runs (switch / new / restore).
   let sessionId = options.sessionId;
@@ -275,6 +276,15 @@ export async function startRepl(options: ReplOptions): Promise<void> {
         if (resolve) resolve(outcome);
         else draw();
       },
+      onCancel: () => {
+        currentAbortController?.abort();
+        if (resolvePermission) {
+          const resolve = resolvePermission;
+          pending = null;
+          resolvePermission = null;
+          resolve("deny");
+        }
+      },
       onClear: () => {
         state = emptyTranscript();
         draw();
@@ -314,29 +324,35 @@ export async function startRepl(options: ReplOptions): Promise<void> {
 
   async function turn(text: string): Promise<void> {
     busy = true;
+    currentAbortController = new AbortController();
     draw();
-    const result = await runTurn({
-      provider: settings.provider(),
-      store: options.store,
-      sessionId,
-      policy: currentPolicy,
-      root: options.root,
-      tools: builtInTools(),
-      prompt: text,
-      onEvent: (event) => {
-        state = reduceTranscript(state, event);
-        draw();
-      },
-      onPermission: (request: PermissionRequest, id: string) =>
-        new Promise<ApprovalOutcome>((resolve) => {
-          pending = { request, id };
-          resolvePermission = resolve;
+    try {
+      const result = await runTurn({
+        provider: settings.provider(),
+        store: options.store,
+        sessionId,
+        policy: currentPolicy,
+        root: options.root,
+        tools: builtInTools(),
+        prompt: text,
+        signal: currentAbortController.signal,
+        onEvent: (event) => {
+          state = reduceTranscript(state, event);
           draw();
-        }),
-    });
-    busy = false;
-    draw();
-    options.onTurnEnd?.(result.reason);
+        },
+        onPermission: (request: PermissionRequest, id: string) =>
+          new Promise<ApprovalOutcome>((resolve) => {
+            pending = { request, id };
+            resolvePermission = resolve;
+            draw();
+          }),
+      });
+      options.onTurnEnd?.(result.reason);
+    } finally {
+      busy = false;
+      currentAbortController = null;
+      draw();
+    }
   }
 
   await instance.waitUntilExit();

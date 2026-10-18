@@ -190,4 +190,51 @@ describe("startRepl turn", () => {
       await rm(dir, { recursive: true, force: true });
     }
   });
+
+  it("triggering onCancel while a turn is in flight aborts runTurn via signal", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "t3os-repl-cancel-"));
+    const store = new SessionStore(dir);
+    const meta = await store.create("tui");
+
+    let capturedSignal: AbortSignal | undefined;
+    const provider: Provider = {
+      id: "cancel-test",
+      capabilities: () => ({ toolCalling: false, streaming: true, contextLength: 8192 }),
+      async *streamChat(_messages, _schemas, opts) {
+        capturedSignal = opts?.signal;
+        // Never yield - simulate long-running stream
+        await new Promise((resolve) => setTimeout(resolve, 10000));
+        yield { type: "done" };
+      },
+    };
+
+    try {
+      void startRepl({
+        provider,
+        store,
+        sessionId: meta.id,
+        policy: createPolicy("ask"),
+        root: dir,
+        model: MODEL,
+      });
+
+      await vi.waitFor(() => {
+        expect(harness.rendered.current).toBeTruthy();
+      });
+
+      harness.rendered.current!.props.onSubmit("start long turn");
+      await vi.waitFor(() => {
+        expect(capturedSignal).toBeDefined();
+        expect(capturedSignal?.aborted).toBe(false);
+      });
+
+      // Trigger cancel
+      harness.rendered.current!.props.onCancel();
+      await vi.waitFor(() => {
+        expect(capturedSignal?.aborted).toBe(true);
+      });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 });
