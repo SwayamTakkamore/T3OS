@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import { Box, Text, useApp, useInput } from "ink";
 import {
   GEMMA_PRESETS,
@@ -158,6 +158,13 @@ export function App({
   const [currentMenu, setCurrentMenu] = useState<SettingsMenuType>("main");
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
+  // Session id awaiting a second Ctrl+D press before actually deleting.
+  const [confirmDeleteSessionId, setConfirmDeleteSessionId] = useState<string | null>(null);
+
+  // Switching menus cancels any pending session-delete confirmation.
+  useEffect(() => {
+    setConfirmDeleteSessionId(null);
+  }, [currentMenu]);
 
   const [activeModel, setActiveModel] = useState<string>(model);
   const [activeEffort, setActiveEffort] = useState<EffortLevel>(effort);
@@ -1115,6 +1122,7 @@ export function App({
     // When settings modal is open, navigate options
     if (isSettingsOpen) {
       if (key.escape) {
+        setConfirmDeleteSessionId(null);
         if (currentMenu !== "main") {
           setCurrentMenu("main");
           setSelectedIndex(0);
@@ -1125,11 +1133,13 @@ export function App({
       }
 
       if (key.upArrow) {
+        setConfirmDeleteSessionId(null);
         setSelectedIndex((prev) => (prev > 0 ? prev - 1 : currentItems.length - 1));
         return;
       }
 
       if (key.downArrow) {
+        setConfirmDeleteSessionId(null);
         setSelectedIndex((prev) => (prev < currentItems.length - 1 ? prev + 1 : 0));
         return;
       }
@@ -1140,10 +1150,23 @@ export function App({
         return;
       }
 
-      // "d" deletes the highlighted session from the Switch/Resume list.
-      if (currentMenu === "sessions-switch" && (value === "d" || value === "D")) {
+      // Ctrl+D deletes the highlighted session from the Switch/Resume list.
+      // The first press arms a confirmation; a second Ctrl+D on the same
+      // session performs the deletion.
+      if (
+        currentMenu === "sessions-switch" &&
+        ((key.ctrl && (value === "d" || value === "\x04")) || value === "\x04")
+      ) {
         const target = sessions?.[selectedIndex];
         if (target) {
+          if (confirmDeleteSessionId !== target.id) {
+            setConfirmDeleteSessionId(target.id);
+            setStatusMessage(
+              "⚠ Press Ctrl+D again to confirm deleting session " + target.id,
+            );
+            return;
+          }
+          setConfirmDeleteSessionId(null);
           const remaining = (sessions?.length ?? 0) - 1;
           if (remaining > 0) {
             setSelectedIndex((prev) => Math.min(prev, remaining - 1));
@@ -1498,7 +1521,9 @@ export function App({
                         {currentMenu === "sessions-switch" &&
                         isSelected &&
                         idx < (sessions?.length ?? 0)
-                          ? "   [d] Delete"
+                          ? confirmDeleteSessionId === sessions?.[idx]?.id
+                            ? "   [Ctrl+D] Confirm Delete"
+                            : "   [Ctrl+D] Delete"
                           : ""}
                       </Text>
                     ) : null}
@@ -1517,7 +1542,9 @@ export function App({
           >
             <Text dimColor>
               {currentMenu === "sessions-switch"
-                ? "[↑/↓] Navigate   [Enter] Select   [d] Delete"
+                ? confirmDeleteSessionId
+                  ? "[↑/↓] Navigate   [Enter] Select   [Ctrl+D] Confirm Delete   [Esc] Cancel"
+                  : "[↑/↓] Navigate   [Enter] Select   [Ctrl+D] Delete"
                 : "[↑/↓] Navigate   [Enter] Select"}
             </Text>
             <Text dimColor>

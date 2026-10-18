@@ -13,6 +13,7 @@ import { transcriptFromEvents } from "../src/repl.js";
 const tick = (ms = 60) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const CTRL_P = "\x10";
+const CTRL_D = "\x04";
 const DOWN = "\u001B[B";
 const ENTER = "\r";
 
@@ -266,7 +267,7 @@ describe("App sessions menu", () => {
     expect(onRestoreBackup).toHaveBeenCalledWith("/tmp/backups/a.jsonl");
   });
 
-  it("deletes the highlighted session with the d key", async () => {
+  it("deletes the highlighted session with Ctrl+D (confirm required)", async () => {
     const onDeleteSession = vi.fn().mockResolvedValue(undefined);
     const { stdin, lastFrame } = render(
       <App
@@ -292,10 +293,25 @@ describe("App sessions menu", () => {
 
     // The selected row advertises the delete affordance.
     let frame = lastFrame();
-    expect(frame).toContain("[d] Delete");
+    expect(frame).toContain("[Ctrl+D] Delete");
 
-    // "d" deletes the highlighted session (sess-1).
+    // Plain "d" does NOT delete.
     stdin.write("d");
+    await tick(80);
+    expect(onDeleteSession).not.toHaveBeenCalled();
+    frame = lastFrame();
+    expect(frame).toContain("[Ctrl+D] Delete");
+
+    // First Ctrl+D arms a confirmation; nothing is deleted yet.
+    stdin.write(CTRL_D);
+    await tick(80);
+    expect(onDeleteSession).not.toHaveBeenCalled();
+    frame = lastFrame();
+    expect(frame).toContain("Ctrl+D again to confirm");
+    expect(frame).toContain("[Ctrl+D] Confirm Delete");
+
+    // Second Ctrl+D deletes the highlighted session (sess-1).
+    stdin.write(CTRL_D);
     await tick(120);
 
     expect(onDeleteSession).toHaveBeenCalledWith("sess-1");
