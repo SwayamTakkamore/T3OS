@@ -1019,6 +1019,21 @@ export function App({
       return;
     }
 
+    // Permission prompts arrive mid-turn (busy is true), so they must be
+    // handled before the busy guard below swallows every key.
+    if (permission) {
+      if (key.escape) {
+        onPermission("deny");
+        onCancel?.();
+        return;
+      }
+      if (value === "y") onPermission("allow");
+      else if (value === "a") onPermission("always");
+      else if (value === "d") onPermission("session");
+      else if (value === "n") onPermission("deny");
+      return;
+    }
+
     // When busy, Esc cancels the in-flight request
     if (busy) {
       if (key.escape) {
@@ -1205,20 +1220,6 @@ export function App({
     // Ctrl+T: Open Hugging Face token settings
     if ((key.ctrl && (value === "t" || value === "\x14")) || value === "\x14") {
       onOpenToken?.();
-      return;
-    }
-
-    // Handle interactive permission prompts
-    if (permission) {
-      if (key.escape) {
-        onPermission("deny");
-        onCancel?.();
-        return;
-      }
-      if (value === "y") onPermission("allow");
-      else if (value === "a") onPermission("always");
-      else if (value === "d") onPermission("session");
-      else if (value === "n") onPermission("deny");
       return;
     }
 

@@ -4,7 +4,7 @@ import { render } from "ink-testing-library";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { App } from "../src/App.js";
+import { App, type PendingPermission } from "../src/App.js";
 import { emptyTranscript } from "../src/transcript.js";
 import type { DownloadProgress } from "@t3os/core";
 
@@ -1046,5 +1046,70 @@ describe("App", () => {
     await tick(50);
     expect(onCancel).toHaveBeenCalled();
     expect(lastFrame()).toContain("✖ Request cancelled");
+  });
+
+  const pendingShell: PendingPermission = {
+    id: "call-1",
+    request: { tool: "run_shell", toolClass: "execute", args: { command: "ls" } },
+  };
+
+  it.each([
+    ["y", "allow"],
+    ["a", "always"],
+    ["d", "session"],
+    ["n", "deny"],
+  ] as const)(
+    "pressing '%s' on a permission prompt while busy calls onPermission('%s')",
+    async (keyPress, outcome) => {
+      const onPermission = vi.fn();
+      const onCancel = vi.fn();
+      const { stdin, lastFrame } = render(
+        <App
+          state={emptyTranscript()}
+          model="google/gemma-4-31B-it"
+          effort="high"
+          onSubmit={() => {}}
+          busy
+          permission={pendingShell}
+          onPermission={onPermission}
+          onCancel={onCancel}
+        />,
+      );
+
+      await tick(100);
+      expect(lastFrame()).toContain("⚠ Permission Required: run_shell (execute)");
+
+      stdin.write(keyPress);
+      await tick(50);
+
+      expect(onPermission).toHaveBeenCalledTimes(1);
+      expect(onPermission).toHaveBeenCalledWith(outcome);
+      expect(onCancel).not.toHaveBeenCalled();
+    },
+  );
+
+  it("pressing Esc on a permission prompt while busy denies it", async () => {
+    const onPermission = vi.fn();
+    const onCancel = vi.fn();
+    const { stdin } = render(
+      <App
+        state={emptyTranscript()}
+        model="google/gemma-4-31B-it"
+        effort="high"
+        onSubmit={() => {}}
+        busy
+        permission={pendingShell}
+        onPermission={onPermission}
+        onCancel={onCancel}
+      />,
+    );
+
+    await tick(100);
+    stdin.write(ESC);
+    await tick(50);
+
+    expect(onPermission).toHaveBeenCalledTimes(1);
+    expect(onPermission).toHaveBeenCalledWith("deny");
+    expect(onCancel).toHaveBeenCalledTimes(1);
   });
 });
