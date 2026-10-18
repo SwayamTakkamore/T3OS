@@ -39,7 +39,9 @@ async function openSessionsMenu(
 ): Promise<void> {
   stdin.write(CTRL_P);
   await tick(80);
-  for (let i = 0; i < 5; i++) {
+  // Main menu order: Model(0) Effort(1) Permission(2) Provider(3) Check Model(4)
+  // OpenCode(5) Hugging Face Auth(6) Sessions(7).
+  for (let i = 0; i < 7; i++) {
     stdin.write(DOWN);
     await tick(30);
   }

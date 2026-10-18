@@ -10,6 +10,7 @@ import {
   type ApprovalOutcome,
   type DownloadProgress,
   type EffortLevel,
+  type LocalModelStatus,
   type PermissionMode,
   type PermissionRequest,
   type SessionBackup,
@@ -32,13 +33,26 @@ export type SettingsMenuType =
   | "auth"
   | "sessions"
   | "sessions-switch"
-  | "sessions-restore";
+  | "sessions-restore"
+  | "opencode"
+  | "check-model"
+  | "check-model-select";
 
 export interface MenuItem {
   label: string;
   value?: string;
   active?: boolean;
+  /** Optional section header rendered above the first item of each group. */
+  section?: string;
   action: () => void;
+}
+
+/** Cached result of the most recent local-cache check for a model. */
+interface ModelCheckState {
+  model: string;
+  loading: boolean;
+  status: LocalModelStatus | null;
+  error: string | null;
 }
 
 export interface AppProps {
@@ -158,6 +172,18 @@ export function App({
   const [downloadProgress, setDownloadProgress] = useState<DownloadProgress | null>(null);
   const downloadAbortControllerRef = React.useRef<AbortController | null>(null);
   const [spinnerIndex, setSpinnerIndex] = useState(0);
+  /** While a download runs, controls whether the animated download view is
+   * shown or the download simply continues in the background (banner only). */
+  const [downloadViewVisible, setDownloadViewVisible] = useState(true);
+
+  // Check Model state (Settings Palette ▸ T3 Engine ▸ Check Model)
+  const [modelToCheck, setModelToCheck] = useState<string>("");
+  const [checkState, setCheckState] = useState<ModelCheckState | null>(null);
+  const checkSeqRef = React.useRef(0);
+
+  /** Model inspected by the Check Model view: explicit selection first, then
+   * any in-flight download target, then the active model. */
+  const checkTarget = modelToCheck || pendingLocalModel || activeModel;
 
   React.useEffect(() => {
     if (localDialogStep !== "downloading") return;
@@ -170,6 +196,7 @@ export function App({
   // Sync props if changed externally
   React.useEffect(() => {
     setActiveModel(model);
+    setModelToCheck("");
   }, [model]);
   React.useEffect(() => {
     setActiveEffort(effort);
@@ -181,8 +208,56 @@ export function App({
     setActiveProviderType(providerType);
   }, [providerType]);
 
+  /**
+   * Checks whether `target` is present in the local model cache and stores the
+   * result (installed flag, cache path, details) for the Check Model view and
+   * the main-menu status value. The host-provided `onCheckModelInstalled`
+   * verdict wins over the filesystem probe when present.
+   */
+  const runCheck = async (target: string): Promise<void> => {
+    const seq = ++checkSeqRef.current;
+    setCheckState({ model: target, loading: true, status: null, error: null });
+    try {
+      const status = await checkLocalModelInstalled(target);
+      const installed = onCheckModelInstalled
+        ? await onCheckModelInstalled(target)
+        : status.isInstalled;
+      if (seq !== checkSeqRef.current) return;
+      setCheckState({
+        model: target,
+        loading: false,
+        status: {
+          ...status,
+          isInstalled: installed,
+          details: installed
+            ? status.isInstalled
+              ? status.details ?? "Present in local cache"
+              : "Verified in local cache"
+            : "Model not found in local cache",
+        },
+        error: null,
+      });
+    } catch (err) {
+      if (seq !== checkSeqRef.current) return;
+      setCheckState({
+        model: target,
+        loading: false,
+        status: null,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  };
+
+  // Keep the Check Model status fresh for the active model (also priming the
+  // main-menu "Check Model" row before the submenu is ever opened).
+  React.useEffect(() => {
+    void runCheck(model);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [model]);
+
   const initiateLocalModelSwitch = (targetModel: string) => {
     setPendingLocalModel(targetModel);
+    setModelToCheck("");
     setLocalDialogStep("confirm");
     setIsSettingsOpen(false);
   };
@@ -252,9 +327,18 @@ export function App({
     }
   };
 
-  const handleConfirmInstall = async () => {
-    const target = pendingLocalModel || activeModel;
+  /**
+   * Starts downloading/installing the Check-Model target.
+   *
+   * @param fromPalette When the install was triggered from inside the Check
+   * Model view, the palette stays open and progress is rendered inline;
+   * otherwise the standalone animated download overlay takes over the screen.
+   */
+  const handleConfirmInstall = async (fromPalette = false) => {
+    const target = checkTarget;
+    setPendingLocalModel(target);
     setLocalDialogStep("downloading");
+    setDownloadViewVisible(!fromPalette);
     setDownloadProgress(null);
 
     const controller = new AbortController();
@@ -281,7 +365,9 @@ export function App({
 
       if (controller.signal.aborted) {
         setLocalDialogStep("none");
+        setDownloadViewVisible(true);
         setStatusMessage("✖ Download cancelled. Remaining on Cloud.");
+        void runCheck(target);
         return;
       }
 
@@ -289,6 +375,7 @@ export function App({
         const verification = await checkLocalModelInstalled(target);
         const resolvedPath = verification.path || "configured";
         setLocalDialogStep("none");
+        setDownloadViewVisible(true);
         const applied = await applySettingsChange(
           localSwitchUpdate(target),
           `Model ${target} downloaded, but switching to local mode failed`,
@@ -296,18 +383,23 @@ export function App({
         if (applied) {
           setStatusMessage(`✓ Local ONNX model ${resolveLocalModelId(target)} downloaded and path set (${resolvedPath}). Switched to local mode.`);
         }
+        void runCheck(target);
       } else {
         setLocalDialogStep("none");
+        setDownloadViewVisible(true);
         setStatusMessage(`✖ Installation of ${target} failed.`);
+        void runCheck(target);
       }
     } catch (err) {
       setLocalDialogStep("none");
+      setDownloadViewVisible(true);
       if (controller.signal.aborted) {
         setStatusMessage("✖ Download cancelled. Remaining on Cloud.");
       } else {
         const errorMsg = err instanceof Error ? err.message : String(err);
         setStatusMessage(`✖ Installation failed: ${errorMsg}`);
       }
+      void runCheck(target);
     } finally {
       downloadAbortControllerRef.current = null;
     }
@@ -464,6 +556,115 @@ export function App({
       return items;
     }
 
+    if (currentMenu === "opencode") {
+      const infoItems: Array<{ label: string; value: string }> = [
+        { label: "Target Model", value: "opencode/big-pickle" },
+        { label: "Provider Instance", value: "OpenCode (Local & Remote)" },
+        { label: "Reasoning Profile", value: "High / Extra High" },
+        { label: "Auto-Delegation", value: "Enabled (Task Orchestrator)" },
+      ];
+      const items: MenuItem[] = infoItems.map((info) => ({
+        label: info.label,
+        value: info.value,
+        action: () => {},
+      }));
+      items.push({
+        label: "← Back to Main Menu",
+        action: () => {
+          setCurrentMenu("main");
+          setSelectedIndex(5);
+        },
+      });
+      return items;
+    }
+
+    if (currentMenu === "check-model") {
+      const target = checkTarget;
+      const isDownloading =
+        localDialogStep === "downloading" && pendingLocalModel === target;
+      const isChecked = checkState?.model === target && !checkState.loading;
+      const installed = isChecked && (checkState?.status?.isInstalled ?? false);
+
+      const items: MenuItem[] = [];
+      if (isDownloading) {
+        items.push({
+          label: "Cancel Download",
+          value: `${downloadProgress?.percent ?? 0}% complete — confirm first`,
+          action: () => {
+            setLocalDialogStep("confirm_cancel");
+          },
+        });
+      } else if (!isChecked) {
+        // Check in flight: only safe actions are offered until it resolves.
+      } else if (!installed) {
+        items.push({
+          label: "Download & Install Model",
+          value: getModelEstimatedSize(target),
+          action: () => {
+            void handleConfirmInstall(true);
+          },
+        });
+      } else if (activeProviderType === "hf") {
+        items.push({
+          label: "Switch Provider to Local Mode",
+          value: "currently Cloud",
+          action: () => {
+            initiateLocalModelSwitch(target);
+          },
+        });
+      }
+      items.push({
+        label: "Re-check Local Cache",
+        value: "refresh",
+        action: () => {
+          void runCheck(target);
+        },
+      });
+      items.push({
+        label: "Check Different Model",
+        value: `${GEMMA_PRESETS.length} presets`,
+        action: () => {
+          setCurrentMenu("check-model-select");
+          setSelectedIndex(0);
+        },
+      });
+      items.push({
+        label: "← Back to Main Menu",
+        action: () => {
+          setCurrentMenu("main");
+          setSelectedIndex(4);
+        },
+      });
+      return items;
+    }
+
+    if (currentMenu === "check-model-select") {
+      const items: MenuItem[] = GEMMA_PRESETS.map((preset) => {
+        let gen = "Gemma 2";
+        if (preset.id.includes("gemma-4")) gen = "Gemma 4";
+        else if (preset.id.includes("gemma-3")) gen = "Gemma 3";
+        return {
+          label: `[${gen}] ${preset.id}`,
+          value: getModelEstimatedSize(preset.id),
+          active: preset.id === checkTarget,
+          action: () => {
+            setModelToCheck(preset.id);
+            setCurrentMenu("check-model");
+            setSelectedIndex(0);
+            void runCheck(preset.id);
+          },
+        };
+      });
+      items.push({
+        label: "← Back to Check Model",
+        action: () => {
+          setCurrentMenu("check-model");
+          setSelectedIndex(0);
+        },
+      });
+      return items;
+    }
+
     if (currentMenu === "auth") {
       return [
         {
@@ -478,7 +679,7 @@ export function App({
           label: "← Back to Main Menu",
           action: () => {
             setCurrentMenu("main");
-            setSelectedIndex(4);
+            setSelectedIndex(6);
           },
         },
       ];
@@ -533,7 +734,7 @@ export function App({
           label: "← Back to Main Menu",
           action: () => {
             setCurrentMenu("main");
-            setSelectedIndex(5);
+            setSelectedIndex(7);
           },
         },
       ];
@@ -546,7 +747,7 @@ export function App({
         active: session.id === sessionId,
         action: () => {
           setCurrentMenu("main");
-          setSelectedIndex(5);
+          setSelectedIndex(7);
           runSessionAction(
             `Resumed session ${session.id}`,
             () => onSwitchSession?.(session.id),
@@ -569,7 +770,7 @@ export function App({
         value: formatSessionTime(backup.createdAt),
         action: () => {
           setCurrentMenu("main");
-          setSelectedIndex(5);
+          setSelectedIndex(7);
           runSessionAction(
             `Restored backup ${backup.id}`,
             () => onRestoreBackup?.(backup.backupPath),
@@ -586,9 +787,11 @@ export function App({
       return items;
     }
 
-    // Default: Main Menu
+    // Default: Main Menu — grouped into sections (headers rendered between
+    // groups; navigation still moves only over the items themselves).
     return [
       {
+        section: "T3 Engine",
         label: "Model Selection",
         value: activeModel,
         action: () => {
@@ -597,6 +800,7 @@ export function App({
         },
       },
       {
+        section: "T3 Engine",
         label: "Effort & Reasoning",
         value: activeEffort,
         action: () => {
@@ -605,6 +809,7 @@ export function App({
         },
       },
       {
+        section: "T3 Engine",
         label: "Permission Policy",
         value: activePermissionMode,
         action: () => {
@@ -613,6 +818,7 @@ export function App({
         },
       },
       {
+        section: "T3 Engine",
         label: "AI Provider",
         value: activeProviderType === "local" ? "Hugging Face (Local)" : "Hugging Face (Cloud)",
         action: () => {
@@ -621,6 +827,35 @@ export function App({
         },
       },
       {
+        section: "T3 Engine",
+        label: "Check Model",
+        value: (() => {
+          if (localDialogStep === "downloading") {
+            return `Downloading ${downloadProgress?.percent ?? 0}%`;
+          }
+          if (!checkState || checkState.loading) return "Checking…";
+          if (checkState.error) return "Check failed";
+          return checkState.status?.isInstalled ? "Installed" : "Not installed";
+        })(),
+        action: () => {
+          const target = pendingLocalModel || activeModel;
+          setModelToCheck("");
+          setCurrentMenu("check-model");
+          setSelectedIndex(0);
+          void runCheck(target);
+        },
+      },
+      {
+        section: "OpenCode Integration",
+        label: "OpenCode Orchestrator",
+        value: "opencode/big-pickle",
+        action: () => {
+          setCurrentMenu("opencode");
+          setSelectedIndex(0);
+        },
+      },
+      {
+        section: "T3 Connect",
         label: "Hugging Face Auth",
         value: "Token page",
         action: () => {
@@ -629,6 +864,7 @@ export function App({
         },
       },
       {
+        section: "T3 Connect",
         label: "Sessions",
         value: sessionId ? sessionId.slice(0, 19) : "new",
         action: () => {
@@ -637,6 +873,7 @@ export function App({
         },
       },
       {
+        section: "System",
         label: "Clear Transcript",
         value: "Ctrl+L",
         action: () => {
@@ -645,6 +882,7 @@ export function App({
         },
       },
       {
+        section: "System",
         label: "Close Settings",
         value: "Esc",
         action: () => {
@@ -674,9 +912,99 @@ export function App({
         return "Switch / Resume Session";
       case "sessions-restore":
         return "Restore Session Backup";
+      case "opencode":
+        return "OpenCode Orchestrator";
+      case "check-model":
+        return "Check Model";
+      case "check-model-select":
+        return "Check Different Model";
       default:
         return "Main Menu";
     }
+  };
+
+  /** Info panel rendered above the action list of the Check Model submenu. */
+  const renderCheckModelInfo = (): React.ReactNode => {
+    const target = checkTarget;
+    const isDownloading =
+      localDialogStep === "downloading" && pendingLocalModel === target;
+    const state = checkState?.model === target ? checkState : null;
+
+    return (
+      <Box
+        flexDirection="column"
+        marginBottom={1}
+        borderStyle="single"
+        borderColor="cyan"
+        paddingX={1}
+      >
+        <Box justifyContent="space-between">
+          <Text bold color="cyan">
+            Model Status
+          </Text>
+          <Text color="gray">inspecting local ONNX cache</Text>
+        </Box>
+        <Box justifyContent="space-between">
+          <Text color="gray">Target Model ID</Text>
+          <Text color="white">{target}</Text>
+        </Box>
+        <Box justifyContent="space-between">
+          <Text color="gray">ONNX Model Repository</Text>
+          <Text color="white">{resolveLocalModelId(target)}</Text>
+        </Box>
+        <Box justifyContent="space-between">
+          <Text color="gray">Estimated Download Size</Text>
+          <Text color="white">{getModelEstimatedSize(target)}</Text>
+        </Box>
+
+        {isDownloading ? (
+          <Box flexDirection="column">
+            <Box>
+              <Text color="cyan">{SPINNER_FRAMES[spinnerIndex]} </Text>
+              <Text color="cyan">
+                {renderProgressBar(downloadProgress?.percent ?? 0, 24, spinnerIndex)}{" "}
+              </Text>
+              <Text bold color="white">
+                {downloadProgress?.percent ?? 0}%
+              </Text>
+            </Box>
+            <Box>
+              <Text color="green">{downloadProgress?.formattedSpeed ?? "--"}</Text>
+              <Text color="gray">{"  •  "}</Text>
+              <Text color="magenta">{downloadProgress?.formattedEta ?? "--"}</Text>
+            </Box>
+            {downloadProgress?.formattedDownloaded && downloadProgress?.formattedTotal ? (
+              <Text color="gray">
+                {downloadProgress.formattedDownloaded} / {downloadProgress.formattedTotal}
+              </Text>
+            ) : null}
+            {downloadProgress?.statusText ? (
+              <Text color="gray">{downloadProgress.statusText}</Text>
+            ) : null}
+          </Box>
+        ) : state?.loading ? (
+          <Text color="yellow">⟳ Checking local cache…</Text>
+        ) : state?.error ? (
+          <Text color="red">✖ Check failed: {state.error}</Text>
+        ) : state?.status?.isInstalled ? (
+          <Text bold color="green">
+            ✓ Installed in local cache
+          </Text>
+        ) : state ? (
+          <Text color="red">✖ Not downloaded / Not installed</Text>
+        ) : null}
+
+        {state?.status ? (
+          <>
+            <Text color="gray">Local cache path:</Text>
+            <Text color="white">{state.status.path}</Text>
+            {state.status.details ? (
+              <Text color="gray">{state.status.details}</Text>
+            ) : null}
+          </>
+        ) : null}
+      </Box>
+    );
   };
 
   useInput((value, key) => {
@@ -689,28 +1017,47 @@ export function App({
     // Handle Local Model Dialog Prompts (Confirmation -> Not Installed Check -> Install Prompt -> Downloading -> Confirm Cancel)
     if (localDialogStep !== "none") {
       if (localDialogStep === "downloading") {
-        if (value === "c" || key.escape) {
-          setLocalDialogStep("confirm_cancel");
+        if (!downloadViewVisible) {
+          // Download runs in the background: fall through so the palette and
+          // transcript keep handling input normally.
+        } else {
+          if (key.ctrl && (value === "p" || value === "\x10")) {
+            // Send the download to the background and open Settings Palette.
+            setDownloadViewVisible(false);
+            setIsSettingsOpen(true);
+            setCurrentMenu("main");
+            setSelectedIndex(0);
+            setStatusMessage(null);
+            return;
+          }
+          if (key.escape) {
+            // Keep the download running while viewing the transcript.
+            setDownloadViewVisible(false);
+            return;
+          }
+          if (value === "c") {
+            setLocalDialogStep("confirm_cancel");
+          }
+          return;
         }
-        return;
-      }
-
-      if (localDialogStep === "confirm_cancel") {
+      } else if (localDialogStep === "confirm_cancel") {
         if (value === "y" || key.return) {
           downloadAbortControllerRef.current?.abort();
           setLocalDialogStep("none");
           setPendingLocalModel("");
+          setDownloadViewVisible(true);
           setStatusMessage("✖ Download cancelled. Remaining on Cloud.");
           return;
         }
         if (value === "n" || key.escape) {
           setLocalDialogStep("downloading");
+          // Return to whichever view the user came from (palette when it is
+          // open, the animated overlay otherwise).
+          setDownloadViewVisible(!isSettingsOpen);
           return;
         }
         return;
-      }
-
-      if (localDialogStep === "confirm") {
+      } else if (localDialogStep === "confirm") {
         if (value === "y" || key.return) {
           void handleConfirmSwitchToLocal();
           return;
@@ -722,9 +1069,7 @@ export function App({
           return;
         }
         return;
-      }
-
-      if (localDialogStep === "ask_install") {
+      } else if (localDialogStep === "ask_install") {
         if (value === "y" || key.return) {
           void handleConfirmInstall();
           return;
@@ -977,8 +1322,8 @@ export function App({
         </Box>
       ) : null}
 
-      {/* Step 3: Minimal Animated Download Progress */}
-      {localDialogStep === "downloading" ? (
+      {/* Step 3: Minimal Animated Download Progress (hidden when the download runs in the background) */}
+      {localDialogStep === "downloading" && downloadViewVisible ? (
         <Box
           flexDirection="column"
           borderStyle="round"
@@ -993,7 +1338,7 @@ export function App({
             </Text>
             <Box justifyContent="flex-end">
               <Text color="red">
-                [c] Cancel download
+                [c] Cancel download   [Esc] Continue in background
               </Text>
             </Box>
           </Box>
@@ -1064,8 +1409,10 @@ export function App({
         </Box>
       ) : null}
 
-      {/* Settings Modal (Ctrl+P) */}
-      {isSettingsOpen && localDialogStep === "none" ? (
+      {/* Settings Modal (Ctrl+P) — also available while a download runs in the background */}
+      {isSettingsOpen &&
+      (localDialogStep === "none" ||
+        (localDialogStep === "downloading" && !downloadViewVisible)) ? (
         <Box
           flexDirection="column"
           borderStyle="double"
@@ -1102,30 +1449,42 @@ export function App({
             </Box>
           ) : null}
 
+          {currentMenu === "check-model" ? renderCheckModelInfo() : null}
+
           <Box flexDirection="column">
             {currentItems.map((item, idx) => {
               const isSelected = idx === selectedIndex;
+              const showHeader =
+                item.section &&
+                (idx === 0 || currentItems[idx - 1]?.section !== item.section);
               return (
-                <Box key={idx} justifyContent="space-between">
-                  <Text
-                    color={isSelected ? "cyan" : item.active ? "green" : "white"}
-                    bold={isSelected}
-                  >
-                    {isSelected ? "▸ " : "  "}
-                    {item.label}
-                    {item.active ? " ✓" : ""}
-                  </Text>
-                  {item.value ? (
-                    <Text color={isSelected ? "yellow" : "gray"}>
-                      {item.value}
-                      {currentMenu === "sessions-switch" &&
-                      isSelected &&
-                      idx < (sessions?.length ?? 0)
-                        ? "   [d] Delete"
-                        : ""}
+                <React.Fragment key={idx}>
+                  {showHeader ? (
+                    <Text bold color="yellow">
+                      ─── {item.section} ───
                     </Text>
                   ) : null}
-                </Box>
+                  <Box justifyContent="space-between">
+                    <Text
+                      color={isSelected ? "cyan" : item.active ? "green" : "white"}
+                      bold={isSelected}
+                    >
+                      {isSelected ? "▸ " : "  "}
+                      {item.label}
+                      {item.active ? " ✓" : ""}
+                    </Text>
+                    {item.value ? (
+                      <Text color={isSelected ? "yellow" : "gray"}>
+                        {item.value}
+                        {currentMenu === "sessions-switch" &&
+                        isSelected &&
+                        idx < (sessions?.length ?? 0)
+                          ? "   [d] Delete"
+                          : ""}
+                      </Text>
+                    ) : null}
+                  </Box>
+                </React.Fragment>
               );
             })}
           </Box>
@@ -1146,6 +1505,17 @@ export function App({
               [Esc / Backspace] Back
             </Text>
           </Box>
+        </Box>
+      ) : null}
+
+      {/* Background download indicator (download continues while palette/transcript are in use) */}
+      {localDialogStep === "downloading" && !downloadViewVisible && !isSettingsOpen ? (
+        <Box marginY={0} paddingX={1} borderStyle="single" borderColor="cyan">
+          <Text color="cyan">
+            {SPINNER_FRAMES[spinnerIndex]} Downloading {pendingLocalModel || activeModel} —{" "}
+            {downloadProgress?.percent ?? 0}%
+          </Text>
+          <Text dimColor>  [Ctrl+P] Settings ▸ Check Model for details</Text>
         </Box>
       ) : null}
 
@@ -1235,9 +1605,9 @@ export function App({
           <Text color="yellow">
             [y] Download model   [n] Cancel
           </Text>
-        ) : localDialogStep === "downloading" ? (
+        ) : localDialogStep === "downloading" && downloadViewVisible ? (
           <Text color="cyan">
-            {SPINNER_FRAMES[spinnerIndex]} Downloading… [c] Cancel
+            {SPINNER_FRAMES[spinnerIndex]} Downloading… [c] Cancel   [Esc] Background
           </Text>
         ) : localDialogStep === "confirm_cancel" ? (
           <Text color="red">

@@ -7,6 +7,11 @@ import type { DownloadProgress } from "@t3os/core";
 
 const tick = (ms = 50) => new Promise((resolve) => setTimeout(resolve, ms));
 
+const CTRL_P = "\x10";
+const DOWN = "\u001B[B";
+const ENTER = "\r";
+const ESC = "\u001B";
+
 describe("App", () => {
   it("renders the model and transcript entries", () => {
     const state = emptyTranscript();
@@ -491,5 +496,326 @@ describe("App", () => {
     expect(onChangeProvider).not.toHaveBeenCalled();
     frame = lastFrame();
     expect(frame).toContain("Switch to local model cancelled");
+  });
+
+  it("groups the main settings menu into sections with a live Check Model status", async () => {
+    const state = emptyTranscript();
+    const onCheckModelInstalled = vi.fn().mockResolvedValue(false);
+
+    const { stdin, lastFrame } = render(
+      <App
+        state={state}
+        model="google/gemma-3-4b-it"
+        effort="high"
+        providerType="hf"
+        onSubmit={() => {}}
+        onPermission={() => {}}
+        onCheckModelInstalled={onCheckModelInstalled}
+      />,
+    );
+
+    await tick(100);
+
+    stdin.write("\x10");
+    await tick(100);
+
+    const frame = lastFrame();
+    // Section headers group related settings.
+    expect(frame).toContain("─── T3 Engine ───");
+    expect(frame).toContain("─── OpenCode Integration ───");
+    expect(frame).toContain("─── T3 Connect ───");
+    expect(frame).toContain("─── System ───");
+    // Items inside the sections.
+    expect(frame).toContain("Check Model");
+    expect(frame).toContain("OpenCode Orchestrator");
+    expect(frame).toContain("Sessions");
+    expect(frame).toContain("Clear Transcript");
+    // The Check Model row surfaces the cached install verdict.
+    expect(frame).toContain("Not installed");
+  });
+
+  it("navigates to Check Model and shows status, ONNX repo, size, and cache path", async () => {
+    const state = emptyTranscript();
+    const onCheckModelInstalled = vi.fn().mockResolvedValue(false);
+
+    const { stdin, lastFrame } = render(
+      <App
+        state={state}
+        model="google/gemma-3-4b-it"
+        effort="high"
+        providerType="hf"
+        onSubmit={() => {}}
+        onPermission={() => {}}
+        onCheckModelInstalled={onCheckModelInstalled}
+      />,
+    );
+
+    await tick(100);
+
+    stdin.write("\x10");
+    await tick(100);
+    // Down to "Check Model" (index 4 in the T3 Engine section).
+    for (let i = 0; i < 4; i++) {
+      stdin.write(DOWN);
+      await tick(30);
+    }
+    stdin.write(ENTER);
+    await tick(100);
+
+    let frame = lastFrame();
+    expect(frame).toContain("Settings Palette ▸ Check Model");
+    expect(frame).toContain("Target Model ID");
+    expect(frame).toContain("google/gemma-3-4b-it");
+    expect(frame).toContain("ONNX Model Repository");
+    expect(frame).toContain("onnx-community/gemma-3-4b-it-ONNX");
+    expect(frame).toContain("~2.4 GB");
+    expect(frame).toContain("✖ Not downloaded / Not installed");
+    expect(frame).toContain("Local cache path:");
+    // The cache path is rendered on its own line as an absolute path.
+    expect(frame).toMatch(/Local cache path:[^\n]*\n[^\n]*\//);
+    expect(frame).toContain("Download & Install Model");
+    expect(frame).toContain("Check Different Model");
+
+    // "Check Different Model" lists every preset for inspection.
+    for (let i = 0; i < 2; i++) {
+      stdin.write(DOWN);
+      await tick(30);
+    }
+    stdin.write(ENTER);
+    await tick(100);
+    frame = lastFrame();
+    expect(frame).toContain("Settings Palette ▸ Check Different Model");
+    expect(frame).toContain("[Gemma 4] google/gemma-4-31B-it");
+    expect(frame).toContain("[Gemma 3] google/gemma-3-12b-it");
+
+    // Inspect gemma-3-12b-it without switching the active model.
+    for (let i = 0; i < 3; i++) {
+      stdin.write(DOWN);
+      await tick(30);
+    }
+    stdin.write(ENTER);
+    await tick(100);
+    frame = lastFrame();
+    expect(frame).toContain("Settings Palette ▸ Check Model");
+    expect(frame).toContain("google/gemma-3-12b-it");
+    expect(frame).toContain("~7.0 GB");
+  });
+
+  it("opens the OpenCode Orchestrator informational submenu", async () => {
+    const state = emptyTranscript();
+    const { stdin, lastFrame } = render(
+      <App
+        state={state}
+        model="google/gemma-4-31B-it"
+        effort="high"
+        onSubmit={() => {}}
+        onPermission={() => {}}
+      />,
+    );
+
+    await tick(100);
+
+    stdin.write(CTRL_P);
+    await tick(100);
+    // Down to "OpenCode Orchestrator" (index 5).
+    for (let i = 0; i < 5; i++) {
+      stdin.write(DOWN);
+      await tick(30);
+    }
+    stdin.write(ENTER);
+    await tick(100);
+
+    const frame = lastFrame();
+    expect(frame).toContain("Settings Palette ▸ OpenCode Orchestrator");
+    expect(frame).toContain("opencode/big-pickle");
+    expect(frame).toContain("OpenCode (Local & Remote)");
+    expect(frame).toContain("High / Extra High");
+    expect(frame).toContain("Enabled (Task Orchestrator)");
+    expect(frame).toContain("← Back to Main Menu");
+  });
+
+  it("downloads from Check Model, shows live progress, and cancels with re-ask", async () => {
+    const state = emptyTranscript();
+    let triggerProgress: ((prog: DownloadProgress) => void) | null = null;
+    let receivedSignal: AbortSignal | undefined;
+
+    const onCheckModelInstalled = vi.fn().mockResolvedValue(false);
+    const onInstallModel = vi.fn().mockImplementation((_target, onProg, signal) => {
+      triggerProgress = onProg;
+      receivedSignal = signal;
+      return new Promise((resolve) => {
+        signal?.addEventListener("abort", () => {
+          resolve(false);
+        });
+      });
+    });
+
+    const { stdin, lastFrame } = render(
+      <App
+        state={state}
+        model="google/gemma-3-4b-it"
+        effort="high"
+        providerType="hf"
+        onSubmit={() => {}}
+        onPermission={() => {}}
+        onCheckModelInstalled={onCheckModelInstalled}
+        onInstallModel={onInstallModel}
+      />,
+    );
+
+    await tick(100);
+
+    // Settings Palette ▸ Check Model ▸ Download & Install Model
+    stdin.write(CTRL_P);
+    await tick(100);
+    for (let i = 0; i < 4; i++) {
+      stdin.write(DOWN);
+      await tick(30);
+    }
+    stdin.write(ENTER);
+    await tick(100);
+
+    let frame = lastFrame();
+    expect(frame).toContain("Download & Install Model");
+    stdin.write(ENTER);
+    await tick(100);
+
+    // The palette stays open on Check Model with the download running.
+    frame = lastFrame();
+    expect(frame).toContain("Cancel Download");
+    expect(onInstallModel).toHaveBeenCalled();
+
+    triggerProgress?.({
+      percent: 45,
+      downloadedBytes: 1.12 * 1024 * 1024 * 1024,
+      totalBytes: 2.46 * 1024 * 1024 * 1024,
+      speedBytesPerSec: 28.4 * 1024 * 1024,
+      etaSeconds: 42,
+      formattedSpeed: "28.4 MB/s",
+      formattedEta: "42s remaining",
+      formattedDownloaded: "1.12 GB",
+      formattedTotal: "2.46 GB",
+      statusText: "Downloading ONNX token embeddings (onnx-community/gemma-3-4b-it-ONNX/onnx/embed_tokens.onnx)…",
+    });
+    await tick(100);
+
+    frame = lastFrame();
+    expect(frame).toContain("45%");
+    expect(frame).toContain("28.4 MB/s");
+    expect(frame).toContain("42s remaining");
+    expect(frame).toContain("1.12 GB / 2.46 GB");
+    expect(frame).toContain("Downloading ONNX token embeddings");
+    expect(frame).toContain("Cancel Download");
+
+    // Enter on "Cancel Download" asks for confirmation before aborting.
+    stdin.write(ENTER);
+    await tick(100);
+    frame = lastFrame();
+    expect(frame).toContain("Cancel Model Download?");
+    expect(frame).toContain("45% complete");
+    expect(frame).toContain("[y] Yes, cancel download");
+    expect(frame).toContain("[n] Continue downloading");
+
+    stdin.write("y");
+    await tick(150);
+
+    expect(receivedSignal?.aborted).toBe(true);
+    frame = lastFrame();
+    expect(frame).toContain("Download cancelled");
+  });
+
+  it("keeps the download running in the background when Esc is pressed during download", async () => {
+    const state = emptyTranscript();
+    let triggerProgress: ((prog: DownloadProgress) => void) | null = null;
+
+    const onCheckModelInstalled = vi.fn().mockResolvedValue(false);
+    const onInstallModel = vi.fn().mockImplementation((_target, onProg, signal) => {
+      triggerProgress = onProg;
+      return new Promise((resolve) => {
+        signal?.addEventListener("abort", () => {
+          resolve(false);
+        });
+      });
+    });
+
+    const { stdin, lastFrame } = render(
+      <App
+        state={state}
+        model="google/gemma-3-4b-it"
+        effort="high"
+        providerType="hf"
+        onSubmit={() => {}}
+        onPermission={() => {}}
+        onCheckModelInstalled={onCheckModelInstalled}
+        onInstallModel={onInstallModel}
+      />,
+    );
+
+    await tick(100);
+
+    // Start a download through the provider switch flow (overlay view).
+    stdin.write(CTRL_P);
+    await tick(100);
+    for (let i = 0; i < 3; i++) {
+      stdin.write(DOWN);
+      await tick(30);
+    }
+    stdin.write(ENTER);
+    await tick(100);
+    stdin.write(DOWN);
+    await tick(30);
+    stdin.write(ENTER);
+    await tick(100);
+    stdin.write("y");
+    await tick(100);
+    stdin.write("y");
+    await tick(100);
+
+    triggerProgress?.({
+      percent: 30,
+      downloadedBytes: 0.74 * 1024 * 1024 * 1024,
+      totalBytes: 2.46 * 1024 * 1024 * 1024,
+      speedBytesPerSec: 25.0 * 1024 * 1024,
+      etaSeconds: 69,
+      formattedSpeed: "25.0 MB/s",
+      formattedEta: "1m 9s remaining",
+      formattedDownloaded: "758 MB",
+      formattedTotal: "2.46 GB",
+      statusText: "Downloading ONNX decoder weights…",
+    });
+    await tick(100);
+    expect(lastFrame()).toContain("30%");
+
+    // Esc backgrounds the download: the transcript stays usable and a slim
+    // banner keeps reporting live progress.
+    stdin.write(ESC);
+    await tick(100);
+    let frame = lastFrame();
+    expect(frame).toContain("Downloading google/gemma-3-4b-it — 30%");
+    expect(frame).toContain("[Ctrl+P] Settings ▸ Check Model");
+
+    // Reopen Settings and open Check Model: live progress is shown there too.
+    stdin.write(CTRL_P);
+    await tick(100);
+    for (let i = 0; i < 4; i++) {
+      stdin.write(DOWN);
+      await tick(30);
+    }
+    stdin.write(ENTER);
+    await tick(100);
+    frame = lastFrame();
+    expect(frame).toContain("30%");
+    expect(frame).toContain("25.0 MB/s");
+    expect(frame).toContain("Cancel Download");
+
+    // Declining the cancel confirmation returns to the palette's progress view.
+    stdin.write(ENTER);
+    await tick(100);
+    expect(lastFrame()).toContain("Cancel Model Download?");
+    stdin.write("n");
+    await tick(100);
+    frame = lastFrame();
+    expect(frame).toContain("Settings Palette ▸ Check Model");
+    expect(frame).toContain("30%");
   });
 });
