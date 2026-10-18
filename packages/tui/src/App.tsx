@@ -41,7 +41,6 @@ export type SettingsMenuType =
   | "sessions"
   | "sessions-switch"
   | "sessions-restore"
-  | "opencode"
   | "check-model"
   | "check-model-select";
 
@@ -581,27 +580,6 @@ export function App({
       return items;
     }
 
-    if (currentMenu === "opencode") {
-      const infoItems: Array<{ label: string; value: string }> = [
-        { label: "Target Model", value: "opencode/big-pickle" },
-        { label: "Provider Instance", value: "OpenCode (Local & Remote)" },
-        { label: "Reasoning Profile", value: "High / Extra High" },
-        { label: "Auto-Delegation", value: "Enabled (Task Orchestrator)" },
-      ];
-      const items: MenuItem[] = infoItems.map((info) => ({
-        label: info.label,
-        value: info.value,
-        action: () => {},
-      }));
-      items.push({
-        label: "← Back to Main Menu",
-        action: () => {
-          setCurrentMenu("main");
-          setSelectedIndex(5);
-        },
-      });
-      return items;
-    }
 
     if (currentMenu === "check-model") {
       const target = checkTarget;
@@ -874,15 +852,7 @@ export function App({
           void runCheck(target);
         },
       },
-      {
-        section: "OpenCode Integration",
-        label: "OpenCode Orchestrator",
-        value: "opencode/big-pickle",
-        action: () => {
-          setCurrentMenu("opencode");
-          setSelectedIndex(0);
-        },
-      },
+
       {
         section: "T3 Connect",
         label: "Hugging Face Auth",
@@ -941,8 +911,6 @@ export function App({
         return "Switch / Resume Session";
       case "sessions-restore":
         return "Restore Session Backup";
-      case "opencode":
-        return "OpenCode Orchestrator";
       case "check-model":
         return "Check Model";
       case "check-model-select":

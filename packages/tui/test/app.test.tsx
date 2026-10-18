@@ -542,12 +542,10 @@ describe("App", () => {
     const frame = lastFrame();
     // Section headers group related settings.
     expect(frame).toContain("─── T3 Engine ───");
-    expect(frame).toContain("─── OpenCode Integration ───");
     expect(frame).toContain("─── T3 Connect ───");
     expect(frame).toContain("─── System ───");
     // Items inside the sections.
     expect(frame).toContain("Check Model");
-    expect(frame).toContain("OpenCode Orchestrator");
     expect(frame).toContain("Sessions");
     expect(frame).toContain("Clear Transcript");
     // The Check Model row surfaces the cached install verdict.
@@ -620,39 +618,6 @@ describe("App", () => {
     expect(frame).toContain("Settings Palette ▸ Check Model");
     expect(frame).toContain("google/gemma-3-12b-it");
     expect(frame).toContain("~7.0 GB");
-  });
-
-  it("opens the OpenCode Orchestrator informational submenu", async () => {
-    const state = emptyTranscript();
-    const { stdin, lastFrame } = render(
-      <App
-        state={state}
-        model="google/gemma-4-31B-it"
-        effort="high"
-        onSubmit={() => {}}
-        onPermission={() => {}}
-      />,
-    );
-
-    await tick(100);
-
-    stdin.write(CTRL_P);
-    await tick(100);
-    // Down to "OpenCode Orchestrator" (index 5).
-    for (let i = 0; i < 5; i++) {
-      stdin.write(DOWN);
-      await tick(30);
-    }
-    stdin.write(ENTER);
-    await tick(100);
-
-    const frame = lastFrame();
-    expect(frame).toContain("Settings Palette ▸ OpenCode Orchestrator");
-    expect(frame).toContain("opencode/big-pickle");
-    expect(frame).toContain("OpenCode (Local & Remote)");
-    expect(frame).toContain("High / Extra High");
-    expect(frame).toContain("Enabled (Task Orchestrator)");
-    expect(frame).toContain("← Back to Main Menu");
   });
 
   it("downloads from Check Model, shows live progress, and cancels with re-ask", async () => {
